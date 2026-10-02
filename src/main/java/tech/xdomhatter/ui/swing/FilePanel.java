@@ -1,0 +1,579 @@
+package tech.xdomhatter.ui.swing;
+
+import com.jcraft.jsch.ChannelSftp;
+import com.jcraft.jsch.Session;
+import tech.xdomhatter.core.model.SshProfile;
+import tech.xdomhatter.core.sftp.SftpOps;
+import tech.xdomhatter.core.sftp.TransferService;
+import tech.xdomhatter.core.util.Fmt;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableModel;
+import java.awt.*;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+public class FilePanel {
+    private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    private final SwingApp app;
+    private final JPanel panel = new JPanel(new BorderLayout(8, 8));
+
+    private final DefaultTableModel localModel = editableModel("名称", "大小", "修改时间");
+    private final DefaultTableModel remoteModel = editableModel("名称", "大小", "修改时间");
+    private final JTable localTable = Ui.table(localModel);
+    private final JTable remoteTable = Ui.table(remoteModel);
+    private final JTextField localPath = new JTextField();
+    private final JTextField remotePath = new JTextField();
+
+    private Path localDir = Path.of(System.getProperty("user.home"));
+    private List<Path> localItems = List.of();
+    private String remoteDir = "/";
+    private List<SftpOps.Entry> remoteEntries = List.of();
+    private SshProfile current;
+
+    public FilePanel(SwingApp app) {
+        this.app = app;
+        build();
+        remotePath.setText("未连接");
+        refreshLocal();
+    }
+
+    public JPanel panel() {
+        return panel;
+    }
+
+    private void build() {
+        panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 8, 12));
+        JPanel localPane = sidePane(localTable, localPath, true);
+        JPanel remotePane = sidePane(remoteTable, remotePath, false);
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, localPane, remotePane);
+        split.setResizeWeight(0.5);
+        split.setBorder(null);
+
+        JPanel bottom = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 6));
+        JButton up = Ui.primary("上传到服务器", "upload");
+        up.addActionListener(e -> uploadSelected());
+        JButton down = Ui.button("下载到本地", "download");
+        down.addActionListener(e -> downloadSelected());
+        JButton open = Ui.button("打开远程文件", "open");
+        open.addActionListener(e -> openSelectedRemoteFile());
+        bottom.add(up);
+        bottom.add(down);
+        bottom.add(open);
+
+        for (JTable t : new JTable[]{localTable, remoteTable}) {
+            Ui.width(t, 0, 240);
+            Ui.width(t, 1, 90);
+            Ui.width(t, 2, 140);
+            Ui.mono(t, 1);
+            Ui.mono(t, 2);
+        }
+
+        panel.add(split, BorderLayout.CENTER);
+        panel.add(bottom, BorderLayout.SOUTH);
+
+        localPath.addActionListener(e -> {
+            Path p = Path.of(localPath.getText().strip());
+            if (Files.isDirectory(p)) {
+                localDir = p;
+                refreshLocal();
+            }
+        });
+        remotePath.addActionListener(e -> {
+            if (current != null) {
+                remoteDir = remotePath.getText().strip();
+                refreshRemote();
+            }
+        });
+
+        localTable.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    int row = localTable.convertRowIndexToModel(localTable.getSelectedRow());
+                    if (row < 0 || row >= localItems.size()) return;
+                    Path p = localItems.get(row);
+                    if (Files.isDirectory(p)) {
+                        localDir = p;
+                        refreshLocal();
+                    } else {
+                        openLocal(p);
+                    }
+                }
+            }
+        });
+        remoteTable.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    int row = remoteTable.convertRowIndexToModel(remoteTable.getSelectedRow());
+                    if (row < 0 || row >= remoteEntries.size()) return;
+                    SftpOps.Entry en = remoteEntries.get(row);
+                    if (en.dir()) {
+                        remoteDir = SftpOps.join(remoteDir, en.name());
+                        refreshRemote();
+                    } else {
+                        openRemote(en.name());
+                    }
+                }
+            }
+        });
+
+        remoteTable.setTransferHandler(new TransferHandler() {
+            @Override
+            public boolean canImport(TransferSupport ts) {
+                return ts.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public boolean importData(TransferSupport ts) {
+                try {
+                    List<File> files = (List<File>) ts.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+                    if (current == null) {
+                        app.status("请先连接服务器");
+                        return false;
+                    }
+                    TransferService.ConflictResolver r = askResolver();
+                    if (r == null) return false;
+                    for (File f : files) {
+                        app.ctx().transfers.upload(current.id, f.toPath(), remoteDir, r);
+                    }
+                    app.status("已接收拖拽上传 " + files.size() + " 项");
+                    return true;
+                } catch (Exception ex) {
+                    return false;
+                }
+            }
+        });
+    }
+
+    private JPanel sidePane(JTable table, JTextField pathField, boolean isLocal) {
+        JPanel p = new JPanel(new BorderLayout(6, 6));
+
+        JButton upBtn = Ui.tool("上级", "up");
+        JButton refreshBtn = Ui.tool(null, "refresh");
+        refreshBtn.setToolTipText("刷新");
+        JButton mkdirBtn = Ui.tool("新建文件夹", "folder");
+        JButton delBtn = Ui.tool("删除", "trash");
+        JButton renBtn = Ui.tool("重命名", "edit");
+        upBtn.addActionListener(e -> {
+            if (isLocal) {
+                Path parent = localDir.getParent();
+                if (parent != null) {
+                    localDir = parent;
+                    refreshLocal();
+                }
+            } else if (current != null) {
+                remoteDir = SftpOps.parent(remoteDir);
+                refreshRemote();
+            }
+        });
+        refreshBtn.addActionListener(e -> {
+            if (isLocal) refreshLocal();
+            else refreshRemote();
+        });
+        mkdirBtn.addActionListener(e -> mkdir(isLocal));
+        delBtn.addActionListener(e -> deleteSelected(isLocal));
+        renBtn.addActionListener(e -> renameSelected(isLocal));
+
+        JPanel bar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
+        bar.setOpaque(false);
+        bar.add(upBtn);
+        bar.add(refreshBtn);
+        bar.add(mkdirBtn);
+        bar.add(delBtn);
+        bar.add(renBtn);
+
+        JPanel head = new JPanel(new BorderLayout(8, 0));
+        head.setOpaque(false);
+        head.add(Ui.section(isLocal ? "本地" : "远程"), BorderLayout.WEST);
+        head.add(bar, BorderLayout.EAST);
+
+        JPanel north = new JPanel(new BorderLayout(0, 4));
+        north.setOpaque(false);
+        north.add(head, BorderLayout.NORTH);
+        north.add(pathField, BorderLayout.CENTER);
+
+        JScrollPane scroll = new JScrollPane(table);
+        scroll.setBorder(null);
+        p.add(north, BorderLayout.NORTH);
+        p.add(scroll, BorderLayout.CENTER);
+        table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        return p;
+    }
+
+    private static DefaultTableModel editableModel(Object... cols) {
+        return new DefaultTableModel(cols, 0) {
+            @Override
+            public boolean isCellEditable(int r, int c) {
+                return false;
+            }
+        };
+    }
+
+    // ---------- 本地 ----------
+
+    private void refreshLocal() {
+        localPath.setText(localDir.toString());
+        localModel.setRowCount(0);
+        List<Path> items = new ArrayList<>();
+        try (var st = Files.list(localDir)) {
+            items = st.sorted(Comparator
+                    .comparing((Path p) -> !Files.isDirectory(p))
+                    .thenComparing(p -> p.getFileName().toString().toLowerCase())).toList();
+            for (Path p : items) {
+                var a = Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes.class);
+                localModel.addRow(new Object[]{
+                        p.getFileName().toString(),
+                        a.isDirectory() ? "<目录>" : Fmt.bytes(a.size()),
+                        TS.format(a.lastModifiedTime().toInstant().atZone(ZoneId.systemDefault()))});
+            }
+        } catch (Exception e) {
+            app.status("读取本地目录失败: " + e.getMessage());
+        }
+        localItems = items;
+    }
+
+    private void openLocal(Path p) {
+        app.status("打开 " + p.getFileName() + " ...");
+        new Thread(() -> {
+            try {
+                app.ctx().openWith.open(p);
+                app.status("已打开 " + p.getFileName());
+            } catch (Exception ex) {
+                app.status("打开失败: " + ex.getMessage());
+            }
+        }, "open-local").start();
+    }
+
+    // ---------- 远程 ----------
+
+    public void onConnected(SshProfile p) {
+        current = p;
+        new Thread(() -> {
+            try {
+                Session s = app.ctx().ssh.session(p.id);
+                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
+                c.connect();
+                String home = SftpOps.home(c);
+                c.disconnect();
+                SwingUtilities.invokeLater(() -> {
+                    if (p == current) {
+                        remoteDir = home;
+                        refreshRemote();
+                    }
+                });
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> {
+                    remoteDir = "/";
+                    refreshRemote();
+                    app.status("获取远程主目录失败，改用 /");
+                });
+            }
+        }, "sftp-home").start();
+    }
+
+    public void onDisconnected(String profileId) {
+        if (current != null && current.id.equals(profileId)) {
+            current = null;
+            remoteEntries = List.of();
+            remoteModel.setRowCount(0);
+            remotePath.setText("未连接");
+        }
+    }
+
+    private void refreshRemote() {
+        if (current == null) {
+            remotePath.setText("未连接");
+            remoteModel.setRowCount(0);
+            return;
+        }
+        remotePath.setText(remoteDir);
+        SshProfile prof = current;
+        String dir = remoteDir;
+        new Thread(() -> {
+            try {
+                Session s = app.ctx().ssh.session(prof.id);
+                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
+                c.connect();
+                List<SftpOps.Entry> es = SftpOps.list(c, dir);
+                c.disconnect();
+                SwingUtilities.invokeLater(() -> {
+                    if (prof != current) return;
+                    remoteEntries = es;
+                    remoteModel.setRowCount(0);
+                    for (SftpOps.Entry e : es) {
+                        remoteModel.addRow(new Object[]{
+                                e.name(),
+                                e.dir() ? "<目录>" : Fmt.bytes(e.size()),
+                                TS.format(Instant.ofEpochMilli(e.mtime()).atZone(ZoneId.systemDefault()))});
+                    }
+                });
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> app.status("读取远程目录失败: " + e.getMessage()));
+            }
+        }, "sftp-list").start();
+    }
+
+    private interface SftpAction {
+        void run(ChannelSftp c) throws Exception;
+    }
+
+    private void withSftp(String what, SftpAction action) {
+        SshProfile prof = current;
+        if (prof == null) {
+            info("请先连接服务器");
+            return;
+        }
+        new Thread(() -> {
+            try {
+                Session s = app.ctx().ssh.session(prof.id);
+                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
+                c.connect();
+                try {
+                    action.run(c);
+                } finally {
+                    c.disconnect();
+                }
+                SwingUtilities.invokeLater(() -> {
+                    refreshRemote();
+                    app.status(what + " 完成");
+                });
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> app.status(what + " 失败: " + e.getMessage()));
+            }
+        }, "sftp-op").start();
+    }
+
+    private void openRemote(String name) {
+        SshProfile prof = current;
+        if (prof == null) return;
+        String remote = SftpOps.join(remoteDir, name);
+        app.status("下载并打开 " + name + " ...");
+        new Thread(() -> {
+            try {
+                Path tmpDir = Files.createTempDirectory("justserving-open");
+                Path target = tmpDir.resolve(name);
+                Session s = app.ctx().ssh.session(prof.id);
+                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
+                c.connect();
+                c.get(remote, target.toString());
+                c.disconnect();
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        app.ctx().openWith.open(target);
+                        app.status("已打开 " + name);
+                    } catch (Exception ex) {
+                        app.status("打开失败: " + ex.getMessage());
+                    }
+                });
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> app.status("打开远程文件失败: " + e.getMessage()));
+            }
+        }, "open-remote").start();
+    }
+
+    // ---------- 传输 ----------
+
+    private TransferService.ConflictResolver askResolver() {
+        Object[] opts = {"覆盖", "跳过", "重命名", "每次询问"};
+        int r = JOptionPane.showOptionDialog(app.frame(), "目标文件已存在时如何处理？", "冲突策略",
+                JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, opts, opts[0]);
+        return switch (r) {
+            case 0 -> n -> TransferService.Conflict.OVERWRITE;
+            case 1 -> n -> TransferService.Conflict.SKIP;
+            case 2 -> n -> TransferService.Conflict.RENAME;
+            case 3 -> n -> askOnce(n);
+            default -> null;
+        };
+    }
+
+    private TransferService.Conflict askOnce(String name) {
+        int[] res = new int[]{-1};
+        Runnable dialog = () -> {
+            Object[] o2 = {"覆盖", "跳过", "重命名"};
+            res[0] = JOptionPane.showOptionDialog(app.frame(), "“" + name + "” 已存在", "文件冲突",
+                    JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, o2, o2[0]);
+        };
+        try {
+            if (SwingUtilities.isEventDispatchThread()) dialog.run();
+            else SwingUtilities.invokeAndWait(dialog);
+        } catch (Exception ignored) {
+        }
+        return switch (res[0]) {
+            case 0 -> TransferService.Conflict.OVERWRITE;
+            case 1 -> TransferService.Conflict.SKIP;
+            default -> TransferService.Conflict.RENAME;
+        };
+    }
+
+    private void uploadSelected() {
+        if (current == null) {
+            info("请先连接服务器");
+            return;
+        }
+        int[] rows = localTable.getSelectedRows();
+        if (rows.length == 0) {
+            info("请先在左侧选择要上传的文件/文件夹（支持直接拖拽到右侧）");
+            return;
+        }
+        TransferService.ConflictResolver r = askResolver();
+        if (r == null) return;
+        for (int row : rows) {
+            Path p = localItems.get(localTable.convertRowIndexToModel(row));
+            app.ctx().transfers.upload(current.id, p, remoteDir, r);
+        }
+        app.status("已加入上传队列 " + rows.length + " 项");
+    }
+
+    private void downloadSelected() {
+        if (current == null) {
+            info("请先连接服务器");
+            return;
+        }
+        int[] rows = remoteTable.getSelectedRows();
+        if (rows.length == 0) {
+            info("请先在右侧选择要下载的文件/文件夹");
+            return;
+        }
+        TransferService.ConflictResolver r = askResolver();
+        if (r == null) return;
+        for (int row : rows) {
+            SftpOps.Entry en = remoteEntries.get(remoteTable.convertRowIndexToModel(row));
+            app.ctx().transfers.download(current.id, SftpOps.join(remoteDir, en.name()), localDir, r);
+        }
+        app.status("已加入下载队列 " + rows.length + " 项");
+    }
+
+    private void openSelectedRemoteFile() {
+        int row = remoteTable.getSelectedRow();
+        if (row < 0) {
+            info("请先在右侧选择文件");
+            return;
+        }
+        SftpOps.Entry en = remoteEntries.get(remoteTable.convertRowIndexToModel(row));
+        if (en.dir()) info("请选择文件（非目录）");
+        else openRemote(en.name());
+    }
+
+    // ---------- 增删改 ----------
+
+    private void mkdir(boolean isLocal) {
+        String name = prompt("新建文件夹", "名称:");
+        if (name == null || name.isBlank()) return;
+        if (isLocal) {
+            try {
+                Files.createDirectory(localDir.resolve(name.strip()));
+                refreshLocal();
+            } catch (Exception e) {
+                app.status("新建文件夹失败: " + e.getMessage());
+            }
+        } else {
+            withSftp("新建文件夹", c -> c.mkdir(SftpOps.join(remoteDir, name.strip())));
+        }
+    }
+
+    private void deleteSelected(boolean isLocal) {
+        if (isLocal) {
+            int[] rows = localTable.getSelectedRows();
+            if (rows.length == 0) {
+                info("请先选择要删除的项");
+                return;
+            }
+            if (JOptionPane.showConfirmDialog(app.frame(), "删除选中的 " + rows.length + " 项？", "确认",
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION) return;
+            boolean fail = false;
+            for (int row : rows) {
+                Path p = localItems.get(localTable.convertRowIndexToModel(row));
+                try {
+                    if (Files.isDirectory(p)) {
+                        try (var st = Files.walk(p)) {
+                            st.sorted(Comparator.reverseOrder()).forEach(x -> {
+                                try {
+                                    Files.deleteIfExists(x);
+                                } catch (Exception ignored) {
+                                }
+                            });
+                        }
+                    } else {
+                        Files.deleteIfExists(p);
+                    }
+                } catch (Exception e) {
+                    fail = true;
+                    app.status("删除失败: " + e.getMessage());
+                }
+            }
+            if (!fail) app.status("删除完成");
+            refreshLocal();
+        } else {
+            int[] rows = remoteTable.getSelectedRows();
+            if (rows.length == 0) {
+                info("请先选择要删除的项");
+                return;
+            }
+            if (JOptionPane.showConfirmDialog(app.frame(), "删除服务器上选中的 " + rows.length + " 项？", "确认",
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION) return;
+            List<String> targets = new ArrayList<>();
+            for (int row : rows) {
+                SftpOps.Entry en = remoteEntries.get(remoteTable.convertRowIndexToModel(row));
+                targets.add(SftpOps.join(remoteDir, en.name()));
+            }
+            withSftp("删除", c -> {
+                for (String t : targets) SftpOps.deleteRecursive(c, t);
+            });
+        }
+    }
+
+    private void renameSelected(boolean isLocal) {
+        String name = prompt("重命名", "新名称:");
+        if (name == null || name.isBlank()) return;
+        if (isLocal) {
+            int row = localTable.getSelectedRow();
+            if (row < 0) {
+                info("请先选择要重命名的项");
+                return;
+            }
+            Path p = localItems.get(localTable.convertRowIndexToModel(row));
+            try {
+                Files.move(p, p.resolveSibling(name.strip()));
+                refreshLocal();
+            } catch (Exception e) {
+                app.status("重命名失败: " + e.getMessage());
+            }
+        } else {
+            int row = remoteTable.getSelectedRow();
+            if (row < 0) {
+                info("请先选择要重命名的项");
+                return;
+            }
+            SftpOps.Entry en = remoteEntries.get(remoteTable.convertRowIndexToModel(row));
+            String old = SftpOps.join(remoteDir, en.name());
+            withSftp("重命名", c -> c.rename(old, SftpOps.join(remoteDir, name.strip())));
+        }
+    }
+
+    private String prompt(String title, String label) {
+        JTextField f = new JTextField();
+        JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.add(new JLabel(label), BorderLayout.WEST);
+        p.add(f, BorderLayout.CENTER);
+        int r = JOptionPane.showConfirmDialog(app.frame(), p, title, JOptionPane.OK_CANCEL_OPTION);
+        return r == JOptionPane.OK_OPTION ? f.getText() : null;
+    }
+
+    private void info(String msg) {
+        JOptionPane.showMessageDialog(app.frame(), msg);
+    }
+}
