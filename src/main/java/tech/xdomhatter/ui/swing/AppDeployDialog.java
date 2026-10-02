@@ -38,9 +38,11 @@ public class AppDeployDialog {
 
         JRadioButton gitRadio = new JRadioButton("从 Git 仓库部署");
         JRadioButton uploadRadio = new JRadioButton("上传部署（zip 自动解压）");
+        JRadioButton serverRadio = new JRadioButton("服务器文件部署（不上传文件）");
         ButtonGroup sourceGroup = new ButtonGroup();
         sourceGroup.add(gitRadio);
         sourceGroup.add(uploadRadio);
+        sourceGroup.add(serverRadio);
         JTextField gitUrl = new JTextField();
         gitUrl.putClientProperty(com.formdev.flatlaf.FlatClientProperties.PLACEHOLDER_TEXT, "https://git.example.com/team/app.git");
         JTextField gitBranch = new JTextField();
@@ -73,8 +75,11 @@ public class AppDeployDialog {
             stderr.setText(existing.stderrPath);
             envArea.setText(String.join("\n", existing.env));
             extraArea.setText(String.join("\n", existing.extraPaths));
-            if (existing.sourceType == ManagedApp.SourceType.GIT) gitRadio.setSelected(true);
-            else uploadRadio.setSelected(true);
+            switch (existing.sourceType) {
+                case GIT -> gitRadio.setSelected(true);
+                case SERVER -> serverRadio.setSelected(true);
+                default -> uploadRadio.setSelected(true);
+            }
             gitUrl.setText(existing.gitUrl);
             gitBranch.setText(existing.gitBranch);
             gitAuth.setSelectedIndex("token".equals(existing.gitAuth) ? 1 : 0);
@@ -93,18 +98,24 @@ public class AppDeployDialog {
         java.util.List<JComponent> gitFields = java.util.List.of(gitUrl, gitBranch, gitAuth, gitToken);
         Runnable sync = () -> {
             boolean git = gitRadio.isSelected();
+            boolean server = serverRadio.isSelected();
             for (JComponent c : gitFields) c.setEnabled(git);
-            uploadPath.setEnabled(!git);
-            browse.setEnabled(!git);
+            uploadPath.setEnabled(!git && !server);
+            browse.setEnabled(!git && !server);
+            // 服务器文件部署时目录内容就是应用本体，清空会删掉要用的文件
+            cleanBox.setEnabled(!server);
+            if (server) cleanBox.setSelected(false);
         };
         gitRadio.addActionListener(e -> sync.run());
         uploadRadio.addActionListener(e -> sync.run());
+        serverRadio.addActionListener(e -> sync.run());
         sync.run();
 
         JPanel sourceRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         sourceRow.setOpaque(false);
         sourceRow.add(gitRadio);
         sourceRow.add(uploadRadio);
+        sourceRow.add(serverRadio);
 
         String[] labels = {"名称:", "运行方式:", "部署目录:", "启动命令:", "停止命令:",
                 "标准输入(文件):", "标准输出(文件):", "标准错误(文件):", "环境变量(KEY=VALUE/行):",
@@ -127,8 +138,8 @@ public class AppDeployDialog {
         JButton cancelBtn = Ui.button("取消", "x");
         deployBtn.addActionListener(e -> {
             Result r = build(app, existing, name, runMode, deployDir, startCommand, stopCommand, stdin, stdout,
-                    stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio, uploadPath,
-                    extraArea, cleanBox, startBox, autoStartBox, true);
+                    stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio, serverRadio,
+                    uploadPath, extraArea, cleanBox, startBox, autoStartBox, true);
             if (r != null) {
                 out.set(r);
                 dlg.dispose();
@@ -136,8 +147,8 @@ public class AppDeployDialog {
         });
         saveBtn.addActionListener(e -> {
             Result r = build(app, existing, name, runMode, deployDir, startCommand, stopCommand, stdin, stdout,
-                    stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio, uploadPath,
-                    extraArea, cleanBox, startBox, autoStartBox, false);
+                    stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio, serverRadio,
+                    uploadPath, extraArea, cleanBox, startBox, autoStartBox, false);
             if (r != null) {
                 out.set(r);
                 dlg.dispose();
@@ -164,7 +175,7 @@ public class AppDeployDialog {
                                 JTextField stdin, JTextField stdout, JTextField stderr, JTextArea envArea,
                                 JRadioButton gitRadio, JTextField gitUrl, JTextField gitBranch,
                                 JComboBox<String> gitAuth, JPasswordField gitToken, JRadioButton uploadRadio,
-                                JTextField uploadPath, JTextArea extraArea, JCheckBox cleanBox,
+                                JRadioButton serverRadio, JTextField uploadPath, JTextArea extraArea, JCheckBox cleanBox,
                                 JCheckBox startBox, JCheckBox autoStartBox, boolean deployNow) {
         String nm = name.getText().strip();
         String dir = deployDir.getText().strip();
@@ -174,6 +185,7 @@ public class AppDeployDialog {
             return null;
         }
         boolean git = gitRadio.isSelected();
+        boolean server = serverRadio.isSelected();
         String url = gitUrl.getText().strip();
         boolean tokenAuth = git && gitAuth.getSelectedIndex() == 1;
         String token = tokenAuth ? new String(gitToken.getPassword()) : null;
@@ -187,8 +199,9 @@ public class AppDeployDialog {
                     "校验失败", JOptionPane.WARNING_MESSAGE);
             return null;
         }
-        Path upload = !git && deployNow ? (uploadPath.getText().isBlank() ? null : Path.of(uploadPath.getText().strip())) : null;
-        if (deployNow && !git && upload == null) {
+        boolean needUpload = !git && !server;
+        Path upload = needUpload && deployNow ? (uploadPath.getText().isBlank() ? null : Path.of(uploadPath.getText().strip())) : null;
+        if (deployNow && needUpload && upload == null) {
             JOptionPane.showMessageDialog(app.frame(), "请选择要上传的 zip/文件/文件夹", "校验失败", JOptionPane.WARNING_MESSAGE);
             return null;
         }
@@ -208,7 +221,8 @@ public class AppDeployDialog {
             String t = line.strip();
             if (!t.isEmpty()) a.env.add(t);
         }
-        a.sourceType = git ? ManagedApp.SourceType.GIT : ManagedApp.SourceType.UPLOAD;
+        a.sourceType = git ? ManagedApp.SourceType.GIT
+                : server ? ManagedApp.SourceType.SERVER : ManagedApp.SourceType.UPLOAD;
         a.gitUrl = url;
         a.gitBranch = gitBranch.getText().strip();
         a.gitAuth = tokenAuth ? "token" : "none";

@@ -227,6 +227,23 @@ public class AppManager {
         return "已解压到 " + app.deployDir;
     }
 
+    /**
+     * 服务器文件部署：应用文件已在部署目录中（经文件管理、wget 等方式放置），不做任何上传/下载，
+     * 仅确保目录存在并检查是否为空；目录创建失败抛异常，空目录返回 "@@EMPTY" 供界面提示。
+     */
+    public String deployExisting(String profileId, ManagedApp app) throws Exception {
+        Session s = ssh.session(profileId);
+        String dir = app.deployDir;
+        String cmd = "if [ -d " + q(dir) + " ]; then "
+                + "if [ -z \"$(ls -A " + q(dir) + " 2>/dev/null)\" ]; then echo '@@EMPTY'; else echo '@@OK'; fi; "
+                + "elif mkdir -p " + q(dir) + " 2>/dev/null; then echo '@@CREATED'; "
+                + "else echo '@@FAIL'; fi";
+        SshManager.ExecResult r = SshManager.exec(s, cmd, FILE_TIMEOUT);
+        String out = r.stdout().strip();
+        if (out.contains("@@FAIL")) throw new IllegalStateException("无法创建部署目录（检查路径与权限）: " + dir);
+        return out;
+    }
+
     private void waitTask(TransferService.Task t) throws Exception {
         while (true) {
             TransferService.State st = t.state;

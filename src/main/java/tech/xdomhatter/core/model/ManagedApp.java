@@ -10,7 +10,7 @@ import java.util.List;
 public class ManagedApp {
     public enum RunMode { DETACHED, SYSTEMD }
 
-    public enum SourceType { GIT, UPLOAD }
+    public enum SourceType { GIT, UPLOAD, SERVER }
 
     public String id = "";
     public String name = "";
@@ -52,6 +52,7 @@ public class ManagedApp {
             String b = gitBranch == null || gitBranch.isBlank() ? "" : " @" + gitBranch;
             return "git" + b;
         }
+        if (sourceType == SourceType.SERVER) return "服务器文件";
         return "上传";
     }
 }

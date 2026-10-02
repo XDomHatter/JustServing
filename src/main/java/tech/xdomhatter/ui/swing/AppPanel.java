@@ -13,7 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-/** 企业服务管理：服务器端应用的部署（git/zip/文件/文件夹）、目录维护、一键启停、下载与前台调试。 */
+/** 企业服务管理：服务器端应用的部署（git/上传/服务器已有文件）、目录维护、一键启停、下载与前台调试。 */
 public class AppPanel {
     private final SwingApp app;
     private final JPanel panel = new JPanel(new BorderLayout(8, 8));
@@ -205,6 +205,7 @@ public class AppPanel {
 
     private void saveAndMaybeDeploy(SshProfile p, AppDeployDialog.Result r) {
         app.status("正在保存应用 " + r.app().name + " ...");
+        String[] serverCheck = {null};
         new SwingWorker<Void, Void>() {
             Exception err;
 
@@ -219,6 +220,12 @@ public class AppPanel {
                     app.status("正在部署 " + saved.name + " ...");
                     if (saved.sourceType == ManagedApp.SourceType.GIT) {
                         app.ctx().apps.deployGit(p.id, saved, r.cleanBefore());
+                    } else if (saved.sourceType == ManagedApp.SourceType.SERVER) {
+                        // 不上传任何文件：仅确保目录存在；空目录提醒先放置应用文件
+                        if (app.ctx().apps.deployExisting(p.id, saved).contains("@@EMPTY")) {
+                            serverCheck[0] = "部署目录为空: " + saved.deployDir
+                                    + "\n请先通过“文件”页或其他方式将应用文件放到该目录，再启动应用。";
+                        }
                     } else if (r.uploadSource() != null) {
                         app.ctx().apps.deployUpload(p.id, saved, r.uploadSource(), r.cleanBefore());
                     }
@@ -243,6 +250,11 @@ public class AppPanel {
                     app.status("应用 " + r.app().name + " 已保存"
                             + (r.deployNow() ? "并部署完成" : "")
                             + (r.startAfter() ? "，已启动" : ""));
+                    if (serverCheck[0] != null) {
+                        app.status("应用 " + r.app().name + " 已保存，但部署目录为空");
+                        JOptionPane.showMessageDialog(app.frame(), serverCheck[0],
+                                "服务器文件部署", JOptionPane.INFORMATION_MESSAGE);
+                    }
                     refresh();
                 } catch (Exception e) {
                     Throwable t = e.getCause() != null ? e.getCause() : e;
@@ -304,6 +316,13 @@ public class AppPanel {
         }
         SshProfile p = requireProfile();
         if (p == null) return;
+        if (a.sourceType == ManagedApp.SourceType.SERVER) {
+            JOptionPane.showMessageDialog(app.frame(),
+                    "“" + a.name + "”使用服务器文件部署，没有可拉取或上传的更新来源。\n"
+                            + "如已手动更新了服务器上 " + a.deployDir + " 中的文件，直接“重启”即可生效。",
+                    "提示", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         if (a.sourceType == ManagedApp.SourceType.GIT) {
             int r = JOptionPane.showConfirmDialog(app.frame(),
                     "从仓库拉取最新代码更新 “" + a.name + "”？", "确认更新", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
