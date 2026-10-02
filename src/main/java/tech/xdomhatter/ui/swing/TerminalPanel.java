@@ -1,9 +1,12 @@
 package tech.xdomhatter.ui.swing;
 
 import com.jediterm.terminal.TerminalColor;
+import com.jediterm.terminal.TextStyle;
 import com.jediterm.terminal.emulator.ColorPalette;
+import com.jediterm.terminal.model.StyleState;
 import com.jediterm.terminal.ui.JediTermWidget;
 import com.jediterm.terminal.ui.settings.DefaultSettingsProvider;
+import com.jediterm.terminal.ui.settings.SettingsProvider;
 import tech.xdomhatter.core.model.SshProfile;
 import tech.xdomhatter.core.terminal.ShellHandle;
 import tech.xdomhatter.core.terminal.ShellTtyConnector;
@@ -15,7 +18,13 @@ import java.awt.*;
 public class TerminalPanel {
     private final SwingApp app;
     private final JPanel panel = new JPanel(new BorderLayout(8, 8));
-    private final JPanel host = new JPanel(new BorderLayout());
+    private final JPanel host = new JPanel(new BorderLayout()) {
+        @Override
+        public void updateUI() {
+            super.updateUI();
+            setBackground(Ui.isDark() ? new Color(0x1B1C1E) : Ui.c("Panel.background", Color.WHITE));
+        }
+    };
     private final JLabel state = Ui.hint("未连接");
     private final JLabel placeholder = Ui.hint(" 连接服务器后自动打开终端，或在左侧选中已连接的服务器后点「连接/重连」");
 
@@ -33,7 +42,6 @@ public class TerminalPanel {
 
     private void build() {
         panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
-        host.setBackground(new Color(0x1B1C1E));
 
         JButton open = Ui.button("连接/重连", "connect");
         open.addActionListener(e -> openTerminal(app.selectedProfile()));
@@ -81,7 +89,7 @@ public class TerminalPanel {
                 try {
                     ShellHandle ch = get();
                     // 注意：JediTermWidget 的 TermSize 构造器会触发 JDK 25 javac 内部错误，必须用 (cols, rows) 构造器
-                    JediTermWidget w = new JediTermWidget(120, 32, new TermSettings());
+                    ThemedTerm w = new ThemedTerm(120, 32, new TermSettings());
                     w.setTtyConnector(new ShellTtyConnector(ch));
                     host.removeAll();
                     host.add(w, BorderLayout.CENTER);
@@ -103,7 +111,7 @@ public class TerminalPanel {
     public static void openChannelWindow(JFrame owner, String title, ShellHandle ch) {
         JDialog dlg = new JDialog(owner, title, false);
         dlg.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
-        JediTermWidget w = new JediTermWidget(120, 32, new TermSettings());
+        ThemedTerm w = new ThemedTerm(120, 32, new TermSettings());
         w.setTtyConnector(new ShellTtyConnector(ch));
         dlg.add(w);
         dlg.setSize(1000, 640);
@@ -133,10 +141,11 @@ public class TerminalPanel {
         state.setText("未连接");
     }
 
-    /** 终端外观：等宽字体；深色主题下用深色配色，浅色主题用 JediTerm 默认。 */
+    /** 终端外观：等宽字体；深色主题下用深色配色，浅色主题用 JediTerm 默认。主题实时读取，切换后重绘即生效。 */
     private static final class TermSettings extends DefaultSettingsProvider {
         private static final ColorPalette DARK = new DarkPalette();
-        private final boolean dark = Ui.isDark();
+        private static final TerminalColor DARK_FG = TerminalColor.color(new com.jediterm.core.Color(0xD4D7DC));
+        private static final TerminalColor DARK_BG = TerminalColor.color(new com.jediterm.core.Color(0x1B1C1E));
 
         @Override
         public Font getTerminalFont() {
@@ -150,17 +159,51 @@ public class TerminalPanel {
 
         @Override
         public ColorPalette getTerminalColorPalette() {
-            return dark ? DARK : super.getTerminalColorPalette();
+            return Ui.isDark() ? DARK : super.getTerminalColorPalette();
+        }
+
+        /** 仅在 widget 构造时读取，且不会回落到 getDefaultForeground/Background：必须在此返回 RGB 默认样式，
+         *  否则 StyleState 默认为索引 0/15，终端复位（vim/less/clear 等）后经调色板渲染成白底黑字块。 */
+        @Override
+        public TextStyle getDefaultStyle() {
+            return Ui.isDark() ? new TextStyle(DARK_FG, DARK_BG) : super.getDefaultStyle();
         }
 
         @Override
         public TerminalColor getDefaultBackground() {
-            return dark ? TerminalColor.color(new com.jediterm.core.Color(0x1B1C1E)) : super.getDefaultBackground();
+            return Ui.isDark() ? DARK_BG : super.getDefaultBackground();
         }
 
         @Override
         public TerminalColor getDefaultForeground() {
-            return dark ? TerminalColor.color(new com.jediterm.core.Color(0xD4D7DC)) : super.getDefaultForeground();
+            return Ui.isDark() ? DARK_FG : super.getDefaultForeground();
+        }
+    }
+
+    /** 持有 StyleState 引用，主题热切换时同步默认样式（复位/反显/光标块颜色由此派生）。 */
+    private static final class ThemedTerm extends JediTermWidget {
+        private final SettingsProvider provider;
+        private StyleState styleState;
+
+        ThemedTerm(int cols, int rows, SettingsProvider provider) {
+            super(cols, rows, provider);
+            this.provider = provider;
+        }
+
+        @Override
+        protected StyleState createDefaultStyle() {
+            StyleState s = super.createDefaultStyle();
+            styleState = s;
+            return s;
+        }
+
+        @Override
+        public void updateUI() {
+            super.updateUI();
+            if (provider != null && styleState != null) {
+                styleState.setDefaultStyle(provider.getDefaultStyle());
+                repaint();
+            }
         }
     }
 
