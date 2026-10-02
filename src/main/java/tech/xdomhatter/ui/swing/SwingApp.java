@@ -288,6 +288,7 @@ public class SwingApp {
         if (p == null) return;
         ctx.monitor.stop(p.id);
         ctx.tunnels.stopProfile(p.id);
+        ctx.sftp.close(p.id);
         ctx.ssh.disconnect(p.id);
         filePanel.onDisconnected(p.id);
         monitorPanel.onDisconnected(p.id);

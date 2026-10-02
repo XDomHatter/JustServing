@@ -1,46 +1,70 @@
 package tech.xdomhatter.ui.swing;
 
 import com.jcraft.jsch.ChannelSftp;
-import com.jcraft.jsch.Session;
 import tech.xdomhatter.core.model.SshProfile;
 import tech.xdomhatter.core.sftp.SftpOps;
 import tech.xdomhatter.core.sftp.TransferService;
 import tech.xdomhatter.core.util.Fmt;
 
 import javax.swing.*;
-import javax.swing.table.DefaultTableModel;
-import java.awt.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.TableRowSorter;
+import java.awt.BorderLayout;
+import java.awt.Component;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.File;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class FilePanel {
-    private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+    private static final int TREE_WIDTH = 200;
+    private static final int CACHE_MAX = 64;
 
     private final SwingApp app;
     private final JPanel panel = new JPanel(new BorderLayout(8, 8));
 
-    private final DefaultTableModel localModel = editableModel("名称", "大小", "修改时间");
-    private final DefaultTableModel remoteModel = editableModel("名称", "大小", "修改时间");
+    private final FileTableModel localModel = new FileTableModel();
+    private final FileTableModel remoteModel = new FileTableModel();
     private final JTable localTable = Ui.table(localModel);
     private final JTable remoteTable = Ui.table(remoteModel);
     private final JTextField localPath = new JTextField();
     private final JTextField remotePath = new JTextField();
+
+    private DirTree localTree;
+    private DirTree remoteTree;
+    private JComponent localTreeWrap;
+    private JComponent remoteTreeWrap;
 
     private Path localDir = Path.of(System.getProperty("user.home"));
     private List<Path> localItems = List.of();
     private String remoteDir = "/";
     private List<SftpOps.Entry> remoteEntries = List.of();
     private SshProfile current;
+
+    /** 远程目录列表缓存：进入看过的目录先渲染缓存，后台再校准（stale-while-revalidate）。 */
+    private final Map<String, List<SftpOps.Entry>> remoteCache = Collections.synchronizedMap(
+            new LinkedHashMap<>(128, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, List<SftpOps.Entry>> eldest) {
+                    return size() > CACHE_MAX;
+                }
+            });
+    private final AtomicInteger remoteReq = new AtomicInteger();
+    private final AtomicInteger localReq = new AtomicInteger();
 
     public FilePanel(SwingApp app) {
         this.app = app;
@@ -55,8 +79,14 @@ public class FilePanel {
 
     private void build() {
         panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 8, 12));
-        JPanel localPane = sidePane(localTable, localPath, true);
-        JPanel remotePane = sidePane(remoteTable, remotePath, false);
+
+        localTree = new DirTree("此电脑", "", this::listLocalDirs, this::onLocalTreeSelect, msg -> app.status(msg));
+        remoteTree = new DirTree("未连接", null, this::listRemoteDirs, this::onRemoteTreeSelect, msg -> app.status(msg));
+        localTreeWrap = treeWrap(localTree);
+        remoteTreeWrap = treeWrap(remoteTree);
+
+        JPanel localPane = sidePane(localTable, localPath, true, localTreeWrap);
+        JPanel remotePane = sidePane(remoteTable, remotePath, false, remoteTreeWrap);
         JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, localPane, remotePane);
         split.setResizeWeight(0.5);
         split.setBorder(null);
@@ -76,9 +106,9 @@ public class FilePanel {
             Ui.width(t, 0, 240);
             Ui.width(t, 1, 90);
             Ui.width(t, 2, 140);
-            Ui.mono(t, 1);
-            Ui.mono(t, 2);
         }
+        installRenderers(localTable, localModel);
+        installRenderers(remoteTable, remoteModel);
 
         panel.add(split, BorderLayout.CENTER);
         panel.add(bottom, BorderLayout.SOUTH);
@@ -159,12 +189,72 @@ public class FilePanel {
         });
     }
 
-    private JPanel sidePane(JTable table, JTextField pathField, boolean isLocal) {
+    private static JComponent treeWrap(DirTree tree) {
+        tree.setPreferredSize(new Dimension(TREE_WIDTH, 0));
+        return tree;
+    }
+
+    private void installRenderers(JTable t, FileTableModel m) {
+        TableRowSorter<FileTableModel> s = new TableRowSorter<>(m);
+        s.setComparator(0, Comparator
+                .comparingInt((FileTableModel.Row r) -> r.dir() ? 0 : 1)
+                .thenComparing(r -> r.name().toLowerCase()));
+        s.setComparator(1, Comparator.<Long>naturalOrder());
+        s.setComparator(2, Comparator.<Long>naturalOrder());
+        s.setSortKeys(List.of(new RowSorter.SortKey(0, SortOrder.ASCENDING)));
+        t.setRowSorter(s);
+
+        t.getColumnModel().getColumn(0).setCellRenderer(NAME_RENDERER);
+        t.getColumnModel().getColumn(1).setCellRenderer(new SizeRenderer());
+        t.getColumnModel().getColumn(2).setCellRenderer(new TimeRenderer());
+    }
+
+    private static final DefaultTableCellRenderer NAME_RENDERER = new DefaultTableCellRenderer() {
+        @Override
+        public Component getTableCellRendererComponent(JTable t, Object v, boolean sel, boolean foc, int r, int c) {
+            super.getTableCellRendererComponent(t, v, sel, foc, r, c);
+            if (v instanceof FileTableModel.Row row) {
+                setText(row.name());
+                setIcon(FileIcons.iconFor(row.name(), row.dir()));
+            }
+            return this;
+        }
+    };
+
+    private static class SizeRenderer extends DefaultTableCellRenderer {
+        SizeRenderer() {
+            setFont(Ui.monoFont());
+            setHorizontalAlignment(SwingConstants.RIGHT);
+        }
+
+        @Override
+        protected void setValue(Object v) {
+            setText(v instanceof Long n ? (n < 0 ? "<目录>" : Fmt.bytes(n)) : "");
+        }
+    }
+
+    private static class TimeRenderer extends DefaultTableCellRenderer {
+        TimeRenderer() {
+            setFont(Ui.monoFont());
+        }
+
+        @Override
+        protected void setValue(Object v) {
+            setText(v instanceof Long n
+                    ? FileTableModel.TS.format(Instant.ofEpochMilli(n).atZone(ZoneId.systemDefault()))
+                    : "");
+        }
+    }
+
+    private JPanel sidePane(JTable table, JTextField pathField, boolean isLocal, JComponent treeWrap) {
         JPanel p = new JPanel(new BorderLayout(6, 6));
 
         JButton upBtn = Ui.tool("上级", "up");
         JButton refreshBtn = Ui.tool(null, "refresh");
         refreshBtn.setToolTipText("刷新");
+        JButton treeBtn = Ui.tool("目录树", null);
+        treeBtn.setToolTipText("显示/隐藏目录树");
+        treeBtn.setSelected(true);
         JButton mkdirBtn = Ui.tool("新建文件夹", "folder");
         JButton delBtn = Ui.tool("删除", "trash");
         JButton renBtn = Ui.tool("重命名", "edit");
@@ -184,6 +274,12 @@ public class FilePanel {
             if (isLocal) refreshLocal();
             else refreshRemote();
         });
+        treeBtn.addActionListener(e -> {
+            boolean show = !treeWrap.isVisible();
+            treeWrap.setVisible(show);
+            treeBtn.setSelected(show);
+            treeWrap.revalidate();
+        });
         mkdirBtn.addActionListener(e -> mkdir(isLocal));
         delBtn.addActionListener(e -> deleteSelected(isLocal));
         renBtn.addActionListener(e -> renameSelected(isLocal));
@@ -192,6 +288,7 @@ public class FilePanel {
         bar.setOpaque(false);
         bar.add(upBtn);
         bar.add(refreshBtn);
+        bar.add(treeBtn);
         bar.add(mkdirBtn);
         bar.add(delBtn);
         bar.add(renBtn);
@@ -206,44 +303,97 @@ public class FilePanel {
         north.add(head, BorderLayout.NORTH);
         north.add(pathField, BorderLayout.CENTER);
 
-        JScrollPane scroll = new JScrollPane(table);
-        scroll.setBorder(null);
+        JScrollPane tableScroll = new JScrollPane(table);
+        tableScroll.setBorder(null);
+        JPanel center = new JPanel(new BorderLayout());
+        center.add(treeWrap, BorderLayout.WEST);
+        center.add(tableScroll, BorderLayout.CENTER);
+
         p.add(north, BorderLayout.NORTH);
-        p.add(scroll, BorderLayout.CENTER);
+        p.add(center, BorderLayout.CENTER);
         table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
         return p;
     }
 
-    private static DefaultTableModel editableModel(Object... cols) {
-        return new DefaultTableModel(cols, 0) {
-            @Override
-            public boolean isCellEditable(int r, int c) {
-                return false;
+    // ---------- 目录树的数据源 ----------
+
+    private List<DirTree.DirEntry> listLocalDirs(String path) throws Exception {
+        List<DirTree.DirEntry> out = new ArrayList<>();
+        if (path.isEmpty()) {
+            for (Path r : FileSystems.getDefault().getRootDirectories()) {
+                out.add(new DirTree.DirEntry(r.toString(), r.toString()));
             }
-        };
+            return out;
+        }
+        try (var st = Files.list(Path.of(path))) {
+            st.filter(Files::isDirectory)
+                    .map(p -> new DirTree.DirEntry(p.getFileName().toString(), p.toString()))
+                    .forEach(out::add);
+        }
+        return out;
+    }
+
+    private List<DirTree.DirEntry> listRemoteDirs(String path) throws Exception {
+        SshProfile prof = current;
+        if (prof == null) return List.of();
+        return app.ctx().sftp.withChannel(prof.id, c -> {
+            List<DirTree.DirEntry> out = new ArrayList<>();
+            for (SftpOps.Entry e : SftpOps.list(c, path)) {
+                if (e.dir()) out.add(new DirTree.DirEntry(e.name(), SftpOps.join(path, e.name())));
+            }
+            return out;
+        });
+    }
+
+    private void onLocalTreeSelect(String path) {
+        if (path == null || path.isEmpty()) return;
+        Path p = Path.of(path);
+        if (Files.isDirectory(p)) {
+            localDir = p;
+            refreshLocal();
+        }
+    }
+
+    private void onRemoteTreeSelect(String path) {
+        if (path == null || path.isEmpty() || current == null) return;
+        remoteDir = path;
+        refreshRemote();
     }
 
     // ---------- 本地 ----------
 
     private void refreshLocal() {
+        localDir = localDir.toAbsolutePath().normalize();
         localPath.setText(localDir.toString());
-        localModel.setRowCount(0);
-        List<Path> items = new ArrayList<>();
-        try (var st = Files.list(localDir)) {
-            items = st.sorted(Comparator
-                    .comparing((Path p) -> !Files.isDirectory(p))
-                    .thenComparing(p -> p.getFileName().toString().toLowerCase())).toList();
-            for (Path p : items) {
-                var a = Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes.class);
-                localModel.addRow(new Object[]{
-                        p.getFileName().toString(),
-                        a.isDirectory() ? "<目录>" : Fmt.bytes(a.size()),
-                        TS.format(a.lastModifiedTime().toInstant().atZone(ZoneId.systemDefault()))});
+        localTree.reveal(localChain(localDir));
+        final Path dir = localDir;
+        final int req = localReq.incrementAndGet();
+        new Thread(() -> {
+            List<Path> items = new ArrayList<>();
+            List<FileTableModel.Row> rows = new ArrayList<>();
+            try (var st = Files.list(dir)) {
+                List<Path> sorted = st.sorted(Comparator
+                        .comparing((Path p) -> !Files.isDirectory(p))
+                        .thenComparing(p -> p.getFileName().toString().toLowerCase())).toList();
+                for (Path p : sorted) {
+                    var a = Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes.class);
+                    boolean isDir = a.isDirectory();
+                    items.add(p);
+                    rows.add(new FileTableModel.Row(p.getFileName().toString(), isDir,
+                            isDir ? -1 : a.size(), a.lastModifiedTime().toMillis()));
+                }
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> {
+                    if (req == localReq.get()) app.status("读取本地目录失败: " + e.getMessage());
+                });
+                return;
             }
-        } catch (Exception e) {
-            app.status("读取本地目录失败: " + e.getMessage());
-        }
-        localItems = items;
+            SwingUtilities.invokeLater(() -> {
+                if (req != localReq.get()) return;
+                localItems = items;
+                localModel.set(rows);
+            });
+        }, "local-list").start();
     }
 
     private void openLocal(Path p) {
@@ -258,73 +408,117 @@ public class FilePanel {
         }, "open-local").start();
     }
 
+    /** 本地路径 → 树节点链（[根盘符, ..., 目标]）。 */
+    private static List<String> localChain(Path p) {
+        Path root = p.getRoot();
+        if (root == null) return List.of(p.toString());
+        List<String> chain = new ArrayList<>();
+        chain.add(root.toString());
+        Path acc = root;
+        for (int i = 0; i < p.getNameCount(); i++) {
+            acc = acc.resolve(p.getName(i));
+            chain.add(acc.toString());
+        }
+        return chain;
+    }
+
     // ---------- 远程 ----------
 
     public void onConnected(SshProfile p) {
         current = p;
+        remoteCache.clear();
+        remoteModel.set(List.of());
+        remoteEntries = List.of();
+        remotePath.setText("加载中…");
+        remoteTree.resetRoot("服务器", "/");
+        final int req = remoteReq.incrementAndGet();
         new Thread(() -> {
+            String home = null;
             try {
-                Session s = app.ctx().ssh.session(p.id);
-                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
-                c.connect();
-                String home = SftpOps.home(c);
-                c.disconnect();
-                SwingUtilities.invokeLater(() -> {
-                    if (p == current) {
-                        remoteDir = home;
-                        refreshRemote();
-                    }
-                });
-            } catch (Exception e) {
-                SwingUtilities.invokeLater(() -> {
-                    remoteDir = "/";
-                    refreshRemote();
-                    app.status("获取远程主目录失败，改用 /");
-                });
+                home = app.ctx().sftp.withChannel(p.id, SftpOps::home);
+            } catch (Exception ignored) {
             }
+            final String h = home;
+            SwingUtilities.invokeLater(() -> {
+                if (p != current || req != remoteReq.get()) return;
+                remoteDir = (h == null || h.isBlank()) ? "/" : h;
+                refreshRemote();
+            });
         }, "sftp-home").start();
     }
 
     public void onDisconnected(String profileId) {
         if (current != null && current.id.equals(profileId)) {
             current = null;
+            remoteReq.incrementAndGet();
             remoteEntries = List.of();
-            remoteModel.setRowCount(0);
+            remoteModel.set(List.of());
             remotePath.setText("未连接");
+            remoteCache.clear();
+            remoteTree.resetRoot("未连接", null);
         }
     }
 
     private void refreshRemote() {
         if (current == null) {
             remotePath.setText("未连接");
-            remoteModel.setRowCount(0);
+            remoteEntries = List.of();
+            remoteModel.set(List.of());
             return;
         }
+        remoteDir = normRemote(remoteDir);
         remotePath.setText(remoteDir);
-        SshProfile prof = current;
-        String dir = remoteDir;
+        remoteTree.reveal(remoteChain(remoteDir));
+        final SshProfile prof = current;
+        final String dir = remoteDir;
+        final int req = remoteReq.incrementAndGet();
+
+        List<SftpOps.Entry> cached = remoteCache.get(dir);
+        if (cached != null) applyRemote(req, dir, cached);
+
         new Thread(() -> {
             try {
-                Session s = app.ctx().ssh.session(prof.id);
-                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
-                c.connect();
-                List<SftpOps.Entry> es = SftpOps.list(c, dir);
-                c.disconnect();
+                List<SftpOps.Entry> es = app.ctx().sftp.withChannel(prof.id, c -> SftpOps.list(c, dir));
+                remoteCache.put(dir, es);
+                SwingUtilities.invokeLater(() -> applyRemote(req, dir, es));
+            } catch (Exception e) {
                 SwingUtilities.invokeLater(() -> {
-                    if (prof != current) return;
-                    remoteEntries = es;
-                    remoteModel.setRowCount(0);
-                    for (SftpOps.Entry e : es) {
-                        remoteModel.addRow(new Object[]{
-                                e.name(),
-                                e.dir() ? "<目录>" : Fmt.bytes(e.size()),
-                                TS.format(Instant.ofEpochMilli(e.mtime()).atZone(ZoneId.systemDefault()))});
+                    if (req == remoteReq.get() && dir.equals(remoteDir)) {
+                        app.status("读取远程目录失败: " + e.getMessage());
                     }
                 });
-            } catch (Exception e) {
-                SwingUtilities.invokeLater(() -> app.status("读取远程目录失败: " + e.getMessage()));
             }
         }, "sftp-list").start();
+    }
+
+    private void applyRemote(int req, String dir, List<SftpOps.Entry> es) {
+        if (req != remoteReq.get() || !dir.equals(remoteDir)) return;
+        remoteEntries = es;
+        List<FileTableModel.Row> rows = new ArrayList<>(es.size());
+        for (SftpOps.Entry e : es) {
+            rows.add(new FileTableModel.Row(e.name(), e.dir(), e.dir() ? -1 : e.size(), e.mtime()));
+        }
+        remoteModel.set(rows);
+    }
+
+    /** 远程路径 → 树节点链（["/a", "/a/b", ...]），根目录本身为空链。 */
+    private static List<String> remoteChain(String path) {
+        List<String> chain = new ArrayList<>();
+        String acc = "";
+        for (String seg : path.split("/")) {
+            if (seg.isEmpty()) continue;
+            acc = acc + "/" + seg;
+            chain.add(acc);
+        }
+        return chain;
+    }
+
+    private static String normRemote(String p) {
+        p = p == null ? "" : p.strip();
+        if (p.isEmpty()) return "/";
+        if (!p.startsWith("/")) p = "/" + p;
+        while (p.length() > 1 && p.endsWith("/")) p = p.substring(0, p.length() - 1);
+        return p;
     }
 
     private interface SftpAction {
@@ -337,18 +531,17 @@ public class FilePanel {
             info("请先连接服务器");
             return;
         }
+        String dir = remoteDir;
         new Thread(() -> {
             try {
-                Session s = app.ctx().ssh.session(prof.id);
-                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
-                c.connect();
-                try {
+                app.ctx().sftp.withChannel(prof.id, c -> {
                     action.run(c);
-                } finally {
-                    c.disconnect();
-                }
+                    return null;
+                });
+                remoteCache.remove(dir);
                 SwingUtilities.invokeLater(() -> {
                     refreshRemote();
+                    remoteTree.reload(remoteChain(dir));
                     app.status(what + " 完成");
                 });
             } catch (Exception e) {
@@ -366,11 +559,10 @@ public class FilePanel {
             try {
                 Path tmpDir = Files.createTempDirectory("justserving-open");
                 Path target = tmpDir.resolve(name);
-                Session s = app.ctx().ssh.session(prof.id);
-                ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
-                c.connect();
-                c.get(remote, target.toString());
-                c.disconnect();
+                app.ctx().sftp.withChannel(prof.id, c -> {
+                    c.get(remote, target.toString());
+                    return null;
+                });
                 SwingUtilities.invokeLater(() -> {
                     try {
                         app.ctx().openWith.open(target);
@@ -477,6 +669,7 @@ public class FilePanel {
             try {
                 Files.createDirectory(localDir.resolve(name.strip()));
                 refreshLocal();
+                localTree.reload(localChain(localDir));
             } catch (Exception e) {
                 app.status("新建文件夹失败: " + e.getMessage());
             }
@@ -517,6 +710,7 @@ public class FilePanel {
             }
             if (!fail) app.status("删除完成");
             refreshLocal();
+            localTree.reload(localChain(localDir));
         } else {
             int[] rows = remoteTable.getSelectedRows();
             if (rows.length == 0) {
@@ -549,6 +743,7 @@ public class FilePanel {
             try {
                 Files.move(p, p.resolveSibling(name.strip()));
                 refreshLocal();
+                localTree.reload(localChain(localDir));
             } catch (Exception e) {
                 app.status("重命名失败: " + e.getMessage());
             }

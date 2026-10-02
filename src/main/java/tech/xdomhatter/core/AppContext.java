@@ -5,6 +5,7 @@ import tech.xdomhatter.core.monitor.MonitorService;
 import tech.xdomhatter.core.openwith.OpenWithService;
 import tech.xdomhatter.core.remote.CommandService;
 import tech.xdomhatter.core.remote.ServiceManager;
+import tech.xdomhatter.core.sftp.SftpPool;
 import tech.xdomhatter.core.sftp.TransferService;
 import tech.xdomhatter.core.ssh.SshManager;
 import tech.xdomhatter.core.store.AppPaths;
@@ -19,6 +20,7 @@ public class AppContext {
     public final ConfigStore config;
     public final CredentialVault vault;
     public final SshManager ssh;
+    public final SftpPool sftp;
     public final TransferService transfers;
     public final MonitorService monitor;
     public final SshTunnelManager tunnels;
@@ -29,7 +31,7 @@ public class AppContext {
     public final TerminalService terminals;
     public final AppManager apps;
 
-    private AppContext(ConfigStore config, CredentialVault vault, SshManager ssh,
+    private AppContext(ConfigStore config, CredentialVault vault, SshManager ssh, SftpPool sftp,
                        TransferService transfers, MonitorService monitor,
                        SshTunnelManager tunnels, FrpManager frp, OpenWithService openWith,
                        CommandService commands, ServiceManager services, TerminalService terminals,
@@ -37,6 +39,7 @@ public class AppContext {
         this.config = config;
         this.vault = vault;
         this.ssh = ssh;
+        this.sftp = sftp;
         this.transfers = transfers;
         this.monitor = monitor;
         this.tunnels = tunnels;
@@ -62,7 +65,8 @@ public class AppContext {
         ServiceManager services = new ServiceManager(ssh);
         TerminalService terminals = new TerminalService(ssh);
         AppManager apps = new AppManager(ssh, vault, transfers);
-        return new AppContext(config, vault, ssh, transfers, monitor, tunnels, frp, openWith, commands, services, terminals, apps);
+        SftpPool sftp = new SftpPool(ssh);
+        return new AppContext(config, vault, ssh, sftp, transfers, monitor, tunnels, frp, openWith, commands, services, terminals, apps);
     }
 
     public void shutdown() {
@@ -71,6 +75,7 @@ public class AppContext {
         transfers.shutdown();
         frp.stopAllFrpc();
         terminals.closeAll();
+        sftp.closeAll();
         ssh.disconnectAll();
     }
 }
