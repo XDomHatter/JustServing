@@ -1,34 +1,85 @@
 package tech.xdomhatter.ui.swing;
 
+import tech.xdomhatter.ui.swing.anim.Animator;
+import tech.xdomhatter.ui.swing.anim.Easing;
+import tech.xdomhatter.ui.swing.anim.RollingLabel;
+
 import javax.swing.*;
 import java.awt.*;
 import java.awt.geom.Path2D;
 import java.awt.geom.RoundRectangle2D;
 import java.util.ArrayDeque;
 
-/** 简易历史曲线图：圆角卡片、平滑曲线、渐变填充，颜色随浅/深主题自动适配。 */
+/**
+ * 简易历史曲线图：圆角卡片、平滑曲线、渐变填充，颜色随浅/深主题自动适配。
+ */
 class LineChart extends JComponent {
     private static final int MAX_POINTS = 120;
+    private static final int TWEEN_MS = 700;
 
     private final String title;
     private final double max;
     private final ArrayDeque<Double> vals = new ArrayDeque<>();
+    private final Animator animator = new Animator();
+    private final RollingLabel valueLabel = new RollingLabel();
+    /**
+     * 显示序列：由补间动画向目标序列 vals 平滑逼近；绘制使用它而非 vals。
+     */
+    private double[] display = new double[0];
 
     LineChart(String title, double max) {
         this.title = title;
         this.max = max;
         setOpaque(false);
+        add(valueLabel);
+    }
+
+    private static double[] toArray(ArrayDeque<Double> vals) {
+        double[] a = new double[vals.size()];
+        int i = 0;
+        for (double v : vals) a[i++] = v;
+        return a;
     }
 
     void add(double v) {
         vals.addLast(v);
         while (vals.size() > MAX_POINTS) vals.removeFirst();
-        repaint();
+        valueLabel.setValue(v);
+
+        double[] to = toArray(vals);
+        // 起点为当前显示状态；新出现的点从上一个显示值处"萌芽"，不跳变
+        double[] from = new double[to.length];
+        for (int i = 0; i < to.length; i++) {
+            from[i] = i < display.length ? display[i] : (i > 0 ? from[i - 1] : v);
+        }
+        if (!isShowing()) {
+            display = to;
+            repaint();
+            return;
+        }
+        display = from;
+        // 键控动画：采样间隔内未完成的补间会被下一次 add 取消，从当前显示值续接
+        animator.animate(this, TWEEN_MS, Easing.OUT_CUBIC, p -> {
+            for (int i = 0; i < to.length; i++) {
+                display[i] = from[i] + (to[i] - from[i]) * p;
+            }
+            repaint();
+        }, null);
     }
 
     void clear() {
         vals.clear();
+        display = new double[0];
+        animator.cancel(this);
+        valueLabel.clear();
         repaint();
+    }
+
+    @Override
+    public void doLayout() {
+        // 无布局管理器，右上角数值标签手工定位
+        Dimension pref = valueLabel.getPreferredSize();
+        valueLabel.setBounds(getWidth() - 12 - pref.width, 8, pref.width, pref.height);
     }
 
     @Override
@@ -66,15 +117,8 @@ class LineChart extends JComponent {
         g.setFont(g.getFont().deriveFont(Font.BOLD, 12f));
         g.setColor(dim);
         g.drawString(title, pad, 22);
-        if (!vals.isEmpty()) {
-            String val = String.format("%.1f%%", vals.peekLast());
-            g.setFont(g.getFont().deriveFont(Font.BOLD, 17f));
-            g.setColor(accent);
-            int vw = g.getFontMetrics().stringWidth(val);
-            g.drawString(val, w - pad - vw, 26);
-        }
 
-        double[] arr = vals.stream().mapToDouble(Double::doubleValue).toArray();
+        double[] arr = display;
         if (arr.length == 0) {
             g.setFont(g.getFont().deriveFont(Font.PLAIN, 13f));
             g.setColor(dim);
@@ -112,7 +156,7 @@ class LineChart extends JComponent {
         fill.lineTo(xs[0], bottom);
         fill.closePath();
         g.setPaint(new GradientPaint(0, top, new Color(accent.getRGB() & 0xFFFFFF | 0x50000000, true),
-                0, bottom, new Color(accent.getRGB() & 0xFFFFFF, true)));
+            0, bottom, new Color(accent.getRGB() & 0xFFFFFF, true)));
         g.fill(fill);
 
         g.setColor(accent);

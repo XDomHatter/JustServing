@@ -52,6 +52,8 @@ public class SshManager {
             s.setConfig("StrictHostKeyChecking", "accept-new");
             s.setServerAliveInterval(15_000);
             s.setServerAliveCountMax(4);
+            // socket 读超时：僵死/半开连接（休眠恢复、断网）30s 内抛异常，避免传输线程永久阻塞
+            s.setTimeout(30_000);
             s.connect(10_000);
             sessions.put(p.id, s);
         } catch (JSchException e) {

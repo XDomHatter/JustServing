@@ -1,6 +1,7 @@
 package tech.xdomhatter.ui.swing;
 
 import tech.xdomhatter.core.store.AppPaths;
+import tech.xdomhatter.ui.swing.anim.Motion;
 
 import javax.swing.*;
 import java.awt.*;
@@ -53,6 +54,16 @@ public class SettingsPanel {
         appearance.add(Ui.section("外观"));
         appearance.add(new JLabel("主题:"));
         appearance.add(themeCombo);
+        JCheckBox reduceMotion = new JCheckBox("减少动效", !Motion.enabled());
+        reduceMotion.addActionListener(e ->
+                Motion.setEnabled(!reduceMotion.isSelected()));
+        JComboBox<String> speedCombo = new JComboBox<>(new String[]{"0.5×", "1×", "1.5×", "2×"});
+        speedCombo.setSelectedIndex(Math.round((Motion.speed() - 0.5f) / 0.5f));
+        speedCombo.addActionListener(e ->
+                Motion.setSpeed(0.5f + speedCombo.getSelectedIndex() * 0.5f));
+        appearance.add(reduceMotion);
+        appearance.add(new JLabel("动效速度:"));
+        appearance.add(speedCombo);
 
         // --- 常规 / frp ---
         interval = new JSpinner(new SpinnerNumberModel(st.monitorIntervalMs / 1000, 1, 60, 1));

@@ -19,6 +19,8 @@ import java.util.Locale;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
@@ -55,6 +57,8 @@ public class TransferService {
         volatile boolean cancel;
         volatile ChannelSftp sftp;
         volatile long lastNotify;
+        /** 看门狗依据：最近一次有实际传输进展的时刻（毫秒）。 */
+        volatile long lastProgress = System.currentTimeMillis();
 
         Task(long id, Direction direction, String profileId, String source, String dest) {
             this.id = id;
@@ -80,7 +84,12 @@ public class TransferService {
     private final List<Listener> listeners = new CopyOnWriteArrayList<>();
     private final List<Task> tasks = new CopyOnWriteArrayList<>();
     private final ExecutorService pool;
+    private final ScheduledExecutorService watchdog;
     private final AtomicLong seq = new AtomicLong();
+
+    /** RUNNING 任务超过该时长无任何进展即视为卡死，强制断开释放 worker。 */
+    private static final long STALL_TIMEOUT_MS = 60_000;
+    private static final long SWEEP_INTERVAL_MS = 10_000;
 
     public TransferService(SshManager ssh, int threads) {
         this.ssh = ssh;
@@ -90,6 +99,13 @@ public class TransferService {
             t.setDaemon(true);
             return t;
         });
+        watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "transfer-watchdog");
+            t.setDaemon(true);
+            return t;
+        });
+        // scheduleWithFixedDelay 的任务抛异常会终止后续调度，sweepStalled 内部必须兜底
+        watchdog.scheduleWithFixedDelay(this::sweepStalled, SWEEP_INTERVAL_MS, SWEEP_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     public void addListener(Listener l) {
@@ -134,16 +150,19 @@ public class TransferService {
     }
 
     public void shutdown() {
+        watchdog.shutdownNow();
         pool.shutdownNow();
     }
 
     private void run(Task t, TaskBody body) {
+        if (t.cancel || t.state != State.QUEUED) return;   // 排队期间已被取消/收尾，不占用 worker
         t.state = State.RUNNING;
+        t.lastProgress = System.currentTimeMillis();
         changed(t);
         try {
             Session s = ssh.session(t.profileId);
             ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
-            c.connect();
+            c.connect(10_000);
             t.sftp = c;
             try {
                 body.run();
@@ -151,11 +170,13 @@ public class TransferService {
                 c.disconnect();
                 t.sftp = null;
             }
-            t.state = t.cancel ? State.CANCELLED : State.DONE;
+            if (t.state == State.RUNNING) t.state = t.cancel ? State.CANCELLED : State.DONE;
         } catch (CancelledException e) {
-            t.state = State.CANCELLED;
+            if (t.state == State.RUNNING) t.state = State.CANCELLED;
         } catch (Exception e) {
-            if (t.cancel) {
+            if (t.state != State.RUNNING) {
+                // 看门狗已收尾（FAILED + 超时文案），保留其状态与 error
+            } else if (t.cancel) {
                 t.state = State.CANCELLED;
             } else {
                 t.state = State.FAILED;
@@ -168,6 +189,36 @@ public class TransferService {
 
     private interface TaskBody {
         void run() throws Exception;
+    }
+
+    // ---------- 看门狗：防止僵死连接把固定数量的 worker 全部占死 ----------
+
+    private void sweepStalled() {
+        try {
+            long now = System.currentTimeMillis();
+            for (Task t : tasks) {
+                if (checkStale(t, now, STALL_TIMEOUT_MS)) changed(t);
+            }
+        } catch (Exception ignored) {
+            // 调度任务抛异常会终止后续执行，这里必须兜底
+        }
+    }
+
+    /** RUNNING 且超过 threshold 无进展 → 置 FAILED、置 cancel 并断开通道令阻塞的 IO 抛出。返回是否判定为卡死。 */
+    static boolean checkStale(Task t, long nowMs, long thresholdMs) {
+        if (t.state != State.RUNNING) return false;
+        if (nowMs - t.lastProgress <= thresholdMs) return false;
+        t.state = State.FAILED;
+        t.error = "传输超时（" + (thresholdMs / 1000) + " 秒无进展，连接可能已中断）";
+        t.cancel = true;
+        ChannelSftp c = t.sftp;
+        if (c != null) {
+            try {
+                c.disconnect();
+            } catch (Exception ignored) {
+            }
+        }
+        return true;
     }
 
     // ---------- upload ----------
@@ -190,6 +241,7 @@ public class TransferService {
         try (Stream<Path> st = Files.list(dir)) {
             for (Path child : st.sorted().toList()) {
                 checkCancel(t);
+                t.lastProgress = System.currentTimeMillis();
                 String rp = SftpOps.join(remotePath, child.getFileName().toString());
                 if (Files.isDirectory(child)) {
                     SftpOps.mkdirp(c, rp);
@@ -203,6 +255,7 @@ public class TransferService {
 
     private void uploadFile(Task t, ChannelSftp c, Path local, String target, ConflictResolver r) throws Exception {
         checkCancel(t);
+        t.lastProgress = System.currentTimeMillis();
         t.currentFile = SftpOps.nameOf(target);
         Conflict policy = Conflict.OVERWRITE;
         try {
@@ -213,6 +266,7 @@ public class TransferService {
         }
         if (policy == Conflict.SKIP) {
             t.transferred += Files.size(local);
+            t.lastProgress = System.currentTimeMillis();
             bump(t);
             return;
         }
@@ -256,6 +310,7 @@ public class TransferService {
         Files.createDirectories(localPath);
         for (SftpOps.Entry e : SftpOps.list(c, remotePath)) {
             checkCancel(t);
+            t.lastProgress = System.currentTimeMillis();
             String rp = SftpOps.join(remotePath, e.name());
             if (e.dir()) {
                 downloadDir(t, c, rp, localPath.resolve(e.name()), r);
@@ -267,6 +322,7 @@ public class TransferService {
 
     private void downloadFile(Task t, ChannelSftp c, String remote, Path localDir, ConflictResolver r) throws Exception {
         checkCancel(t);
+        t.lastProgress = System.currentTimeMillis();
         String name = SftpOps.nameOf(remote);
         t.currentFile = name;
         Path target = localDir.resolve(name);
@@ -274,6 +330,7 @@ public class TransferService {
         if (Files.exists(target) && r != null) policy = r.resolve(name);
         if (policy == Conflict.SKIP) {
             t.transferred += c.stat(remote).getSize();
+            t.lastProgress = System.currentTimeMillis();
             bump(t);
             return;
         }
@@ -314,6 +371,7 @@ public class TransferService {
             @Override
             public boolean count(long soFar) {
                 t.transferred = soFar;
+                t.lastProgress = System.currentTimeMillis();
                 long now = System.nanoTime();
                 if (now - lastNs > 500_000_000L) {
                     double bps = (soFar - lastBytes) / ((now - lastNs) / 1e9);
