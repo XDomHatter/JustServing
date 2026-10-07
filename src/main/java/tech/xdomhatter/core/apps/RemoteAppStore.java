@@ -85,6 +85,7 @@ public class RemoteAppStore {
         if (a.deployDir == null) a.deployDir = "";
         if (a.runMode == null) a.runMode = ManagedApp.RunMode.DETACHED;
         if (a.startCommand == null) a.startCommand = "";
+        if (a.deployCommand == null) a.deployCommand = "";
         if (a.stopCommand == null) a.stopCommand = "";
         if (a.stdinPath == null || a.stdinPath.isBlank()) a.stdinPath = "/dev/null";
         if (a.stdoutPath == null) a.stdoutPath = "";

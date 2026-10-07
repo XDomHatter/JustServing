@@ -84,6 +84,45 @@ class AppManagerTest {
         assertFalse(cmd.contains(" > "));
     }
 
+    @Test
+    void multiLineStartCommandDropsExecPrefix() {
+        ManagedApp a = app();
+        a.startCommand = "export RUN_ENV=prod\njava -jar app.jar";
+
+        // exec 只会执行第一行，多行命令必须去掉（PID 指向 bash 包装进程，进程组停止仍然有效）
+        String start = AppManager.startShellCommand(a, "/root");
+        assertTrue(start.contains("setsid bash -c "));
+        assertTrue(start.contains("export RUN_ENV=prod\njava -jar app.jar"));
+        assertFalse(start.contains("exec "));
+
+        String debug = AppManager.debugCommand(a);
+        assertEquals("cd '/opt/order-app' && { export RUN_ENV=prod\njava -jar app.jar; }", debug);
+    }
+
+    @Test
+    void withExecOnlyForSingleLine() {
+        assertEquals("exec java -jar app.jar", AppManager.withExec("java -jar app.jar"));
+        assertEquals("a\nb", AppManager.withExec("a\nb"));
+    }
+
+    @Test
+    void deployShellCommandRunsInDeployDirViaBash() {
+        ManagedApp a = app();
+        a.deployCommand = "npm ci && npm run build";
+        assertEquals("cd '/opt/order-app' && bash -c 'npm ci && npm run build' 2>&1",
+                AppManager.deployShellCommand(a));
+
+        // 多行命令原样保留（q() 单引号包裹），环境变量以 export 前缀嵌入（内层引号经 q() 转义）
+        a.env = List.of("A=1");
+        a.deployCommand = "line1\nline2";
+        String multi = AppManager.deployShellCommand(a);
+        assertTrue(multi.startsWith("cd '/opt/order-app' && bash -c "));
+        assertTrue(multi.contains("export '"));
+        assertTrue(multi.contains("A=1"));
+        assertTrue(multi.contains("line1\nline2"));
+        assertTrue(multi.endsWith(" 2>&1"));
+    }
+
     // ---------- 状态解析 ----------
 
     @Test
@@ -149,7 +188,7 @@ class AppManagerTest {
         a.runMode = ManagedApp.RunMode.SYSTEMD;
         a.env = List.of("MSG=hello \"world\"");
         a.startCommand = "echo \"$HOME/boot $x\"";
-        String unit = AppManager.unitFile(a, "root");
+        String unit = AppManager.unitFile(a, "root", "/root");
 
         assertTrue(unit.contains("WorkingDirectory=/opt/order-app"));
         assertTrue(unit.contains("Environment=\"MSG=hello \\\"world\\\"\""));
@@ -158,7 +197,22 @@ class AppManagerTest {
         assertTrue(unit.contains("StandardOutput=append:/root/.justserving/logs/a1b2c3d4.out.log"));
         assertTrue(unit.contains("Restart=on-failure"));
         assertFalse(unit.contains("User="), "root 用户不应写 User=");
-        assertTrue(AppManager.unitFile(a, "deploy").contains("User=deploy"));
+        assertTrue(AppManager.unitFile(a, "deploy", "/root").contains("User=deploy"));
+    }
+
+    @Test
+    void unitFileMultiLineStartUsesStartupScript() {
+        ManagedApp a = app();
+        a.runMode = ManagedApp.RunMode.SYSTEMD;
+        a.startCommand = "export RUN_ENV=prod\njava -jar app.jar";
+
+        // unit 文件不能包含真实换行，多行命令改引用脚本文件（环境变量仍由 Environment= 提供）
+        String unit = AppManager.unitFile(a, "root", "/root");
+        assertTrue(unit.contains("ExecStart=/bin/bash \"/root/.justserving/scripts/a1b2c3d4-start.sh\""));
+        assertFalse(unit.contains("bash -c"));
+        assertEquals("/root/.justserving/scripts/a1b2c3d4-start.sh",
+                AppManager.startScriptPath("/root", "a1b2c3d4"));
+        assertEquals("export RUN_ENV=prod\njava -jar app.jar\n", AppManager.startScriptContent(a));
     }
 
     @Test

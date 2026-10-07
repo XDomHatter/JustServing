@@ -19,6 +19,7 @@ class RemoteAppStoreTest {
         a.deployDir = "/opt/order-app";
         a.runMode = ManagedApp.RunMode.SYSTEMD;
         a.startCommand = "java -jar app.jar --port=8080";
+        a.deployCommand = "npm ci && npm run build";
         a.stopCommand = "";
         a.stdinPath = "/dev/null";
         a.stdoutPath = "/root/.justserving/logs/a1b2c3d4.out.log";
@@ -44,6 +45,7 @@ class RemoteAppStoreTest {
         assertEquals(a.deployDir, b.deployDir);
         assertEquals(ManagedApp.RunMode.SYSTEMD, b.runMode);
         assertEquals(a.startCommand, b.startCommand);
+        assertEquals(a.deployCommand, b.deployCommand);
         assertEquals(a.env, b.env);
         assertEquals(ManagedApp.SourceType.GIT, b.sourceType);
         assertEquals(a.gitUrl, b.gitUrl);
@@ -72,6 +74,8 @@ class RemoteAppStoreTest {
         assertEquals(ManagedApp.SourceType.UPLOAD, x1.sourceType);
         assertEquals("/dev/null", x1.stdinPath);
         assertEquals("", x1.stdoutPath);
+        // 旧版本文件没有部署命令字段
+        assertEquals("", x1.deployCommand);
         assertTrue(x1.env.isEmpty());
         assertTrue(x1.extraPaths.isEmpty());
 

@@ -52,6 +52,7 @@ public class AppManager {
     private static final long SHORT_TIMEOUT = 20_000;
     private static final long FILE_TIMEOUT = 60_000;
     private static final long GIT_TIMEOUT = 600_000;
+    private static final long DEPLOY_TIMEOUT = 600_000;
 
     private final SshManager ssh;
     private final CredentialVault vault;
@@ -119,8 +120,10 @@ public class AppManager {
         if (app == null) return;
         if (app.runMode == ManagedApp.RunMode.SYSTEMD) {
             String unit = unitName(app);
+            String script = startScriptPath(remoteHome(s), app.id);
             SshManager.exec(s, "systemctl stop " + q(unit) + " 2>/dev/null; systemctl disable " + q(unit)
-                    + " 2>/dev/null; rm -f /etc/systemd/system/" + q(unit) + ".service; systemctl daemon-reload 2>/dev/null; true",
+                    + " 2>/dev/null; rm -f /etc/systemd/system/" + q(unit) + ".service " + q(script)
+                    + "; systemctl daemon-reload 2>/dev/null; true",
                     SHORT_TIMEOUT);
         } else {
             SshManager.exec(s, stopShellCommand(app, remoteHome(s)), SHORT_TIMEOUT);
@@ -244,6 +247,16 @@ public class AppManager {
         return out;
     }
 
+    /** 执行部署命令（仅新建/部署时调用一次）：在部署目录中运行，应用环境变量；空白则跳过。失败抛异常并带输出尾部。 */
+    public String runDeployCommand(String profileId, ManagedApp app) throws Exception {
+        if (app.deployCommand == null || app.deployCommand.isBlank()) return "";
+        Session s = ssh.session(profileId);
+        SshManager.ExecResult r = SshManager.exec(s, deployShellCommand(app), DEPLOY_TIMEOUT);
+        if (r.exitCode() != 0)
+            throw new IllegalStateException("部署命令执行失败:\n" + lastLines(r.stdout() + r.stderr(), 15));
+        return lastLines(r.stdout(), 10);
+    }
+
     private void waitTask(TransferService.Task t) throws Exception {
         while (true) {
             TransferService.State st = t.state;
@@ -318,22 +331,33 @@ public class AppManager {
 
     /** 前台调试命令：在 PTY 终端中交互运行（stdin=键盘、stdout=屏幕），关闭终端即结束应用。 */
     public static String debugCommand(ManagedApp app) {
-        return "cd " + q(app.deployDir) + " && { " + envPrefix(app) + "exec " + app.startCommand + "; }";
+        return "cd " + q(app.deployDir) + " && { " + envPrefix(app) + withExec(app.startCommand) + "; }";
     }
 
     // ---------- systemd 单元 ----------
 
-    /** 写入/更新 systemd 单元文件（内容变化才写 + daemon-reload）。 */
+    /** 写入/更新 systemd 单元文件（内容变化才写 + daemon-reload）；多行启动命令先写脚本文件供单元引用。 */
     public void ensureUnit(Session s, ManagedApp app, String sshUser) throws Exception {
         String unit = unitName(app);
         String path = "/etc/systemd/system/" + unit + ".service";
         String user = sshUser == null || sshUser.isBlank() || "root".equals(sshUser) ? "" : sshUser;
+        String home = remoteHome(s);
+        if (app.startCommand.indexOf('\n') >= 0) {
+            SshManager.exec(s, "mkdir -p " + q(dirname(startScriptPath(home, app.id))), SHORT_TIMEOUT);
+            putRemoteFile(s, startScriptPath(home, app.id), startScriptContent(app));
+        }
         SshManager.ExecResult cur = SshManager.exec(s, "cat " + q(path) + " 2>/dev/null; true", 10_000);
-        String want = unitFile(app, user);
+        String want = unitFile(app, user, home);
         if (cur.stdout().equals(want)) return;
-        Path tmp = Files.createTempFile("justserving-", ".service");
+        putRemoteFile(s, path, want);
+        SshManager.exec(s, "systemctl daemon-reload", 15_000);
+    }
+
+    /** 经 SFTP 写远端文本文件（本地临时文件中转）。 */
+    private void putRemoteFile(Session s, String path, String content) throws Exception {
+        Path tmp = Files.createTempFile("justserving-", ".upload");
         try {
-            Files.writeString(tmp, want, StandardCharsets.UTF_8);
+            Files.writeString(tmp, content, StandardCharsets.UTF_8);
             ChannelSftp c = (ChannelSftp) s.openChannel("sftp");
             c.connect();
             try {
@@ -344,7 +368,6 @@ public class AppManager {
         } finally {
             Files.deleteIfExists(tmp);
         }
-        SshManager.exec(s, "systemctl daemon-reload", 15_000);
     }
 
     /** 开机自启（enable/disable）。 */
@@ -372,19 +395,36 @@ public class AppManager {
         return sb.isEmpty() ? "app" : sb.toString();
     }
 
-    public static String unitFile(ManagedApp app, String user) {
+    public static String unitFile(ManagedApp app, String user, String home) {
         StringBuilder sb = new StringBuilder();
         sb.append("[Unit]\nDescription=").append(unitName(app)).append(" — ").append(app.name).append(" (JustServing 应用)\n");
         sb.append("After=network.target\n\n[Service]\nType=simple\n");
         if (user != null && !user.isBlank() && !"root".equals(user)) sb.append("User=").append(user).append("\n");
         sb.append("WorkingDirectory=").append(app.deployDir).append("\n");
         for (String e : app.env) sb.append("Environment=").append(unitEnvValue(e)).append("\n");
-        sb.append("ExecStart=/bin/bash -c ").append(unitExecArg("exec " + app.startCommand)).append("\n");
+        sb.append("ExecStart=").append(unitExecStart(app, home)).append("\n");
         sb.append("StandardInput=file:").append(app.stdinPath).append("\n");
         sb.append("StandardOutput=append:").append(app.stdoutPath).append("\n");
         sb.append("StandardError=append:").append(app.stderrPath).append("\n");
         sb.append("Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n");
         return sb.toString();
+    }
+
+    /** systemd ExecStart 值：单行命令内联 bash -c；多行命令引用脚本文件（unit 文件不能包含真实换行）。 */
+    static String unitExecStart(ManagedApp app, String home) {
+        if (app.startCommand.indexOf('\n') >= 0)
+            return "/bin/bash \"" + startScriptPath(home, app.id) + "\"";
+        return "/bin/bash -c " + unitExecArg("exec " + app.startCommand);
+    }
+
+    /** systemd 多行启动命令的脚本路径与内容（环境变量由单元 Environment= 提供，脚本只含命令本身）。 */
+    static String startScriptPath(String home, String appId) {
+        return home + "/.justserving/scripts/" + appId + "-start.sh";
+    }
+
+    static String startScriptContent(ManagedApp app) {
+        String cmd = app.startCommand == null ? "" : app.startCommand;
+        return cmd.endsWith("\n") ? cmd : cmd + "\n";
     }
 
     /** systemd Environment= 值：双引号包裹，转义反斜杠与双引号（$ 为字面量）。 */
@@ -489,10 +529,23 @@ public class AppManager {
                 + "elif [ ! -r " + q(app.stdinPath) + " ]; then echo '@@NOSTDIN'; "
                 + "else if mkdir -p " + q(dirname(pid)) + " " + q(dirname(app.stdoutPath)) + " " + q(dirname(app.stderrPath))
                 + " && cd " + q(app.deployDir) + "; then "
-                + "setsid bash -c " + q(envPrefix(app) + "exec " + app.startCommand)
+                + "setsid bash -c " + q(envPrefix(app) + withExec(app.startCommand))
                 + " < " + q(app.stdinPath) + " > " + q(app.stdoutPath) + " 2> " + q(app.stderrPath)
                 + " & echo $! > " + q(pid) + "; echo '@@STARTED'; "
                 + "else echo '@@MKTDIR_FAILED'; fi; fi";
+    }
+
+    /**
+     * 单行命令加 exec 前缀（PID 文件直接指向服务进程）；多行命令不能加——exec 只会执行第一行，
+     * 多行时保留原样（PID 指向 bash 包装进程，服务为其同组子进程，按进程组停止仍然有效）。
+     */
+    static String withExec(String cmd) {
+        return cmd.indexOf('\n') < 0 ? "exec " + cmd : cmd;
+    }
+
+    /** 部署命令执行体：在部署目录中以 bash -c 运行（q() 单引号保留换行，多行原样可用），stderr 并入 stdout。 */
+    static String deployShellCommand(ManagedApp app) {
+        return "cd " + q(app.deployDir) + " && bash -c " + q(envPrefix(app) + app.deployCommand) + " 2>&1";
     }
 
     static String stopShellCommand(ManagedApp app, String home) {

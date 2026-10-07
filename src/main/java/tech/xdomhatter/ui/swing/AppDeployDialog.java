@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** 应用新建/编辑对话框：部署目录、启停命令、标准输入输出、环境变量、部署来源与额外数据路径。 */
+/** 应用新建/编辑对话框：部署目录、启动/部署/停止命令（均支持多行）、标准输入输出、环境变量、部署来源与额外数据路径。 */
 public class AppDeployDialog {
     public record Result(ManagedApp app, String gitToken, Path uploadSource,
                          boolean deployNow, boolean cleanBefore, boolean startAfter) {}
@@ -22,8 +22,16 @@ public class AppDeployDialog {
                 "后台进程（无需 root，断开后继续运行）", "systemd（需 root，支持开机自启）"});
         JTextField deployDir = new JTextField();
         deployDir.putClientProperty(com.formdev.flatlaf.FlatClientProperties.PLACEHOLDER_TEXT, "~/apps/myapp（支持 ~ 前缀）");
-        JTextField startCommand = new JTextField();
-        startCommand.putClientProperty(com.formdev.flatlaf.FlatClientProperties.PLACEHOLDER_TEXT, "例: java -jar app.jar 或 ./bin/start.sh");
+        JTextArea startCommand = new JTextArea(4, 20);
+        startCommand.setFont(Ui.monoFont());
+        startCommand.putClientProperty(com.formdev.flatlaf.FlatClientProperties.PLACEHOLDER_TEXT, "每次启动/重启时执行，支持多行。例: java -jar app.jar");
+        JScrollPane startScroll = new JScrollPane(startCommand);
+        startScroll.setPreferredSize(new Dimension(220, 80));
+        JTextArea deployCommand = new JTextArea(3, 20);
+        deployCommand.setFont(Ui.monoFont());
+        deployCommand.putClientProperty(com.formdev.flatlaf.FlatClientProperties.PLACEHOLDER_TEXT, "可选，仅新建/部署时执行一次。例: npm ci && npm run build");
+        JScrollPane deployScroll = new JScrollPane(deployCommand);
+        deployScroll.setPreferredSize(new Dimension(220, 64));
         JTextField stopCommand = new JTextField();
         stopCommand.putClientProperty(com.formdev.flatlaf.FlatClientProperties.PLACEHOLDER_TEXT, "可选；留空则按 PID 强制结束");
         JTextField stdin = new JTextField("/dev/null");
@@ -69,6 +77,7 @@ public class AppDeployDialog {
             runMode.setSelectedIndex(existing.runMode == ManagedApp.RunMode.SYSTEMD ? 1 : 0);
             deployDir.setText(existing.deployDir);
             startCommand.setText(existing.startCommand);
+            deployCommand.setText(existing.deployCommand);
             stopCommand.setText(existing.stopCommand);
             stdin.setText(existing.stdinPath);
             stdout.setText(existing.stdoutPath);
@@ -117,11 +126,11 @@ public class AppDeployDialog {
         sourceRow.add(uploadRadio);
         sourceRow.add(serverRadio);
 
-        String[] labels = {"名称:", "运行方式:", "部署目录:", "启动命令:", "停止命令:",
+        String[] labels = {"名称:", "运行方式:", "部署目录:", "启动命令:", "部署命令(可选):", "停止命令:",
                 "标准输入(文件):", "标准输出(文件):", "标准错误(文件):", "环境变量(KEY=VALUE/行):",
                 "部署来源:", "仓库地址:", "分支:", "认证方式:", "HTTPS 令牌:", "上传内容:",
                 "额外数据路径(绝对路径/行):", "", "", ""};
-        JComponent[] fields = {name, runMode, deployDir, startCommand, stopCommand,
+        JComponent[] fields = {name, runMode, deployDir, startScroll, deployScroll, stopCommand,
                 stdin, stdout, stderr, envScroll,
                 sourceRow, gitUrl, gitBranch, gitAuth, gitToken, uploadRow,
                 extraScroll, cleanBox, startBox, autoStartBox};
@@ -129,7 +138,7 @@ public class AppDeployDialog {
 
         JScrollPane scroll = new JScrollPane(form);
         scroll.setBorder(null);
-        scroll.setPreferredSize(new Dimension(620, 640));
+        scroll.setPreferredSize(new Dimension(620, 700));
 
         AtomicReference<Result> out = new AtomicReference<>();
         JDialog dlg = new JDialog(app.frame(), existing == null ? "新建应用" : "编辑应用 — " + existing.name, true);
@@ -137,18 +146,18 @@ public class AppDeployDialog {
         JButton saveBtn = Ui.button("保存", "check");
         JButton cancelBtn = Ui.button("取消", "x");
         deployBtn.addActionListener(e -> {
-            Result r = build(app, existing, name, runMode, deployDir, startCommand, stopCommand, stdin, stdout,
-                    stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio, serverRadio,
-                    uploadPath, extraArea, cleanBox, startBox, autoStartBox, true);
+            Result r = build(app, existing, name, runMode, deployDir, startCommand, deployCommand, stopCommand,
+                    stdin, stdout, stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio,
+                    serverRadio, uploadPath, extraArea, cleanBox, startBox, autoStartBox, true);
             if (r != null) {
                 out.set(r);
                 dlg.dispose();
             }
         });
         saveBtn.addActionListener(e -> {
-            Result r = build(app, existing, name, runMode, deployDir, startCommand, stopCommand, stdin, stdout,
-                    stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio, serverRadio,
-                    uploadPath, extraArea, cleanBox, startBox, autoStartBox, false);
+            Result r = build(app, existing, name, runMode, deployDir, startCommand, deployCommand, stopCommand,
+                    stdin, stdout, stderr, envArea, gitRadio, gitUrl, gitBranch, gitAuth, gitToken, uploadRadio,
+                    serverRadio, uploadPath, extraArea, cleanBox, startBox, autoStartBox, false);
             if (r != null) {
                 out.set(r);
                 dlg.dispose();
@@ -171,7 +180,8 @@ public class AppDeployDialog {
     }
 
     private static Result build(SwingApp app, ManagedApp existing, JTextField name, JComboBox<String> runMode,
-                                JTextField deployDir, JTextField startCommand, JTextField stopCommand,
+                                JTextField deployDir, JTextArea startCommand, JTextArea deployCommand,
+                                JTextField stopCommand,
                                 JTextField stdin, JTextField stdout, JTextField stderr, JTextArea envArea,
                                 JRadioButton gitRadio, JTextField gitUrl, JTextField gitBranch,
                                 JComboBox<String> gitAuth, JPasswordField gitToken, JRadioButton uploadRadio,
@@ -179,7 +189,8 @@ public class AppDeployDialog {
                                 JCheckBox startBox, JCheckBox autoStartBox, boolean deployNow) {
         String nm = name.getText().strip();
         String dir = deployDir.getText().strip();
-        String cmd = startCommand.getText().strip();
+        String cmd = startCommand.getText().replace("\r\n", "\n").strip();
+        String deployCmd = deployCommand.getText().replace("\r\n", "\n").strip();
         if (nm.isEmpty() || dir.isEmpty() || cmd.isEmpty()) {
             JOptionPane.showMessageDialog(app.frame(), "名称、部署目录、启动命令必填", "校验失败", JOptionPane.WARNING_MESSAGE);
             return null;
@@ -212,6 +223,7 @@ public class AppDeployDialog {
         a.runMode = runMode.getSelectedIndex() == 1 ? ManagedApp.RunMode.SYSTEMD : ManagedApp.RunMode.DETACHED;
         a.deployDir = dir;
         a.startCommand = cmd;
+        a.deployCommand = deployCmd;
         a.stopCommand = stopCommand.getText().strip();
         a.stdinPath = stdin.getText().isBlank() ? "/dev/null" : stdin.getText().strip();
         a.stdoutPath = stdout.getText().strip();

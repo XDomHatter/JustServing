@@ -229,6 +229,8 @@ public class AppPanel {
                     } else if (r.uploadSource() != null) {
                         app.ctx().apps.deployUpload(p.id, saved, r.uploadSource(), r.cleanBefore());
                     }
+                    app.status("正在执行部署命令 " + saved.name + " ...");
+                    app.ctx().apps.runDeployCommand(p.id, saved);
                 }
                 if (r.startAfter()) {
                     app.status("正在启动 " + saved.name + " ...");
@@ -250,6 +252,8 @@ public class AppPanel {
                     app.status("应用 " + r.app().name + " 已保存"
                             + (r.deployNow() ? "并部署完成" : "")
                             + (r.startAfter() ? "，已启动" : ""));
+                    app.toast((r.deployNow() ? (r.startAfter() ? "已部署并启动 " : "已部署 ")
+                            : (r.startAfter() ? "已启动 " : "已保存 ")) + r.app().name);
                     if (serverCheck[0] != null) {
                         app.status("应用 " + r.app().name + " 已保存，但部署目录为空");
                         JOptionPane.showMessageDialog(app.frame(), serverCheck[0],
@@ -294,6 +298,11 @@ public class AppPanel {
                 try {
                     AppManager.AppStatus st = get();
                     app.status(a.name + " " + action + " 完成 — " + st.text());
+                    app.toast(switch (action) {
+                        case "start" -> "已启动 " + a.name;
+                        case "stop" -> "已停止 " + a.name;
+                        default -> "已重启 " + a.name;
+                    });
                     refresh();
                 } catch (Exception e) {
                     Throwable t = e.getCause() != null ? e.getCause() : e;
@@ -332,7 +341,9 @@ public class AppPanel {
                 @Override
                 protected String doInBackground() throws Exception {
                     ensureConnected(p);
-                    return app.ctx().apps.deployGit(p.id, a, false);
+                    String out = app.ctx().apps.deployGit(p.id, a, false);
+                    app.status("正在执行部署命令 " + a.name + " ...");
+                    return appendDeployCommand(p.id, a, out);
                 }
 
                 @Override
@@ -340,7 +351,12 @@ public class AppPanel {
                     try {
                         String out = get();
                         app.status("已更新 " + a.name);
-                        JOptionPane.showMessageDialog(app.frame(), out, "git 更新完成", JOptionPane.PLAIN_MESSAGE);
+                        // 配置了部署命令时展示其输出（构建日志有排查价值）；否则轻量气泡即可
+                        if (a.deployCommand != null && !a.deployCommand.isBlank()) {
+                            JOptionPane.showMessageDialog(app.frame(), out, "git 更新完成", JOptionPane.PLAIN_MESSAGE);
+                        } else {
+                            app.toast("已更新 " + a.name);
+                        }
                         refresh();
                     } catch (Exception e) {
                         Throwable t = e.getCause() != null ? e.getCause() : e;
@@ -366,7 +382,9 @@ public class AppPanel {
             @Override
             protected String doInBackground() throws Exception {
                 ensureConnected(p);
-                return app.ctx().apps.deployUpload(p.id, a, local, clean);
+                String out = app.ctx().apps.deployUpload(p.id, a, local, clean);
+                app.status("正在执行部署命令 " + a.name + " ...");
+                return appendDeployCommand(p.id, a, out);
             }
 
             @Override
@@ -374,7 +392,12 @@ public class AppPanel {
                 try {
                     String out = get();
                     app.status("已部署 " + a.name);
-                    JOptionPane.showMessageDialog(app.frame(), out, "部署完成", JOptionPane.PLAIN_MESSAGE);
+                    // 配置了部署命令时展示其输出（构建日志有排查价值）；否则轻量气泡即可
+                    if (a.deployCommand != null && !a.deployCommand.isBlank()) {
+                        JOptionPane.showMessageDialog(app.frame(), out, "部署完成", JOptionPane.PLAIN_MESSAGE);
+                    } else {
+                        app.toast("已部署 " + a.name);
+                    }
                     refresh();
                 } catch (Exception e) {
                     Throwable t = e.getCause() != null ? e.getCause() : e;
@@ -383,6 +406,12 @@ public class AppPanel {
                 }
             }
         }.execute();
+    }
+
+    /** 部署完成后执行部署命令（未配置则原样返回部署输出），输出分段追加供完成弹窗展示。 */
+    private String appendDeployCommand(String profileId, ManagedApp a, String deployOut) throws Exception {
+        String out = app.ctx().apps.runDeployCommand(profileId, a);
+        return out.isEmpty() ? deployOut : deployOut + "\n──── 部署命令输出 ────\n" + out;
     }
 
     // ---------- 日志 / 调试 / 下载 / 删除 ----------
@@ -442,19 +471,20 @@ public class AppPanel {
             }
 
             @Override
-            protected void done() {
-                try {
-                    AppManager.DownloadPlan plan = get();
-                    if (plan.skipped().isEmpty()) {
-                        app.status("已开始下载 " + a.name + "（进度见传输页）");
-                    } else {
-                        app.status("已开始下载 " + a.name + "，部分额外数据路径不存在已跳过");
-                        JTextArea area = new JTextArea(String.join("\n", plan.skipped()), 8, 50);
-                        area.setEditable(false);
-                        JOptionPane.showMessageDialog(app.frame(), new JScrollPane(area),
-                                "以下额外数据路径在服务器上不存在，已跳过", JOptionPane.WARNING_MESSAGE);
-                    }
-                } catch (Exception e) {
+                protected void done() {
+                    try {
+                        AppManager.DownloadPlan plan = get();
+                        if (plan.skipped().isEmpty()) {
+                            app.status("已开始下载 " + a.name + "（进度见传输页）");
+                            app.toast("已开始下载 " + a.name + "（进度见传输页）");
+                        } else {
+                            app.status("已开始下载 " + a.name + "，部分额外数据路径不存在已跳过");
+                            JTextArea area = new JTextArea(String.join("\n", plan.skipped()), 8, 50);
+                            area.setEditable(false);
+                            JOptionPane.showMessageDialog(app.frame(), new JScrollPane(area),
+                                    "以下额外数据路径在服务器上不存在，已跳过", JOptionPane.WARNING_MESSAGE);
+                        }
+                    } catch (Exception e) {
                     Throwable t = e.getCause() != null ? e.getCause() : e;
                     JOptionPane.showMessageDialog(app.frame(), "下载失败: " + t.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
                 }
@@ -475,23 +505,24 @@ public class AppPanel {
         app.status("正在删除 " + a.name + " ...");
         new SwingWorker<Void, Void>() {
             @Override
-            protected Void doInBackground() throws Exception {
-                ensureConnected(p);
-                app.ctx().apps.deleteApp(p.id, a.id, removeFiles.isSelected());
-                return null;
-            }
-
-            @Override
-            protected void done() {
-                try {
-                    get();
-                    app.status("已删除 " + a.name);
-                    refresh();
-                } catch (Exception e) {
-                    Throwable t = e.getCause() != null ? e.getCause() : e;
-                    JOptionPane.showMessageDialog(app.frame(), "删除失败: " + t.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+                protected Void doInBackground() throws Exception {
+                    ensureConnected(p);
+                    app.ctx().apps.deleteApp(p.id, a.id, removeFiles.isSelected());
+                    return null;
                 }
-            }
+
+                @Override
+                protected void done() {
+                    try {
+                        get();
+                        app.status("已删除 " + a.name);
+                        app.toast("已删除 " + a.name);
+                        refresh();
+                    } catch (Exception e) {
+                        Throwable t = e.getCause() != null ? e.getCause() : e;
+                        JOptionPane.showMessageDialog(app.frame(), "删除失败: " + t.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+                    }
+                }
         }.execute();
     }
 }

@@ -17,7 +17,10 @@ public class ManagedApp {
     public String deployDir = "";
     public RunMode runMode = RunMode.DETACHED;
 
+    /** 启动命令：仅在启动/重启（及前台调试）时执行，支持多行。 */
     public String startCommand = "";
+    /** 部署命令（可选，支持多行）：仅新建/部署（保存并部署、更新）时执行一次，在部署目录中运行；启动/重启不执行。 */
+    public String deployCommand = "";
     /** 停止命令（可选）：填写则停止时优先执行，否则后台进程模式按 PID 文件杀进程组。 */
     public String stopCommand = "";
 
