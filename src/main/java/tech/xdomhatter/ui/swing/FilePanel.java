@@ -661,21 +661,27 @@ public class FilePanel {
     }
 
     /**
-     * 扫描新完成的上传任务：弹“上传成功”气泡；目标目录是当前浏览目录时防抖刷新列表。
+     * 扫描新完成的上传任务：弹“上传成功 + 文件名”气泡，多个时显示首个文件名加总数；
+     * 目标目录是当前浏览目录时防抖刷新列表。
      * 用任务 id 去重，只对本次事件中首次变为 DONE 的上传任务做出反应。
      */
     private void scanFinishedUploads() {
         String profId = current != null ? current.id : null;
         boolean fresh = false;
         boolean matchesDir = false;
+        String firstName = null;
+        int freshCount = 0;
         for (TransferService.Task t : app.ctx().transfers.tasks()) {
             if (t.direction != TransferService.Direction.UPLOAD || t.state != TransferService.State.DONE) continue;
             if (!seenUploadDone.add(t.id)) continue;
             fresh = true;
+            freshCount++;
+            if (firstName == null) firstName = SftpOps.nameOf(t.source);
             if (profId != null && t.profileId.equals(profId) && t.dest.equals(remoteDir)) matchesDir = true;
         }
         if (!fresh) return;
-        app.toast("上传成功");
+        String name = firstName.length() > 24 ? firstName.substring(0, 24) + "…" : firstName;
+        app.toast(freshCount == 1 ? "上传成功 " + name : "上传成功 " + name + " 等 " + freshCount + " 项");
         if (matchesDir) {
             if (remoteRefreshTimer == null) {
                 remoteRefreshTimer = new Timer(800, e -> refreshRemote());
