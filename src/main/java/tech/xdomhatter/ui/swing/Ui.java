@@ -43,6 +43,7 @@ public final class Ui {
     private static ThemeMode mode = loadMode();
     private static Boolean systemDarkCache;
     private static Font mono;
+    private static Font console;
 
     private Ui() {}
 
@@ -282,6 +283,20 @@ public final class Ui {
             mono = f;
         }
         return mono;
+    }
+
+    /** 控制台/终端字体：Consolas 无中文字形会渲染成方块，改用随包分发的更纱黑体（Sarasa Term SC，OFL 许可），
+     *  ASCII 半宽 + CJK 全宽，与终端双宽字符模型对齐；资源缺失时回退逻辑等宽字体（其组合含中文字形）。 */
+    public static Font consoleFont() {
+        if (console == null) {
+            Font f = null;
+            try (java.io.InputStream in = Ui.class.getResourceAsStream("/fonts/SarasaTermSC-Regular.ttf")) {
+                if (in != null) f = Font.createFont(Font.TRUETYPE_FONT, in).deriveFont(Font.PLAIN, 13f);
+            } catch (Exception ignored) {
+            }
+            console = f != null ? f : new Font(Font.MONOSPACED, Font.PLAIN, 13);
+        }
+        return console;
     }
 
     // ---------- 文本 ----------

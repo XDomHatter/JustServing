@@ -615,7 +615,7 @@ public class TunnelPanel {
     private void showTextDialog(String title, String text) {
         JTextArea area = new JTextArea(text, 24, 70);
         area.setEditable(false);
-        area.setFont(Ui.monoFont());
+        area.setFont(Ui.consoleFont());
         area.setCaretPosition(0);
         JOptionPane.showMessageDialog(app.frame(), new JScrollPane(area), title, JOptionPane.PLAIN_MESSAGE);
     }

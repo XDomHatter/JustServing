@@ -216,7 +216,7 @@ public class ServicePanel {
                     ServiceManager.ServiceDetail d = get();
                     JTextArea area = new JTextArea(28, 88);
                     area.setEditable(false);
-                    area.setFont(Ui.monoFont());
+                    area.setFont(Ui.consoleFont());
                     area.setText(String.join("\n", d.status()) + "\n\n──────── 最近日志 ────────\n" + String.join("\n", d.log()));
                     area.setCaretPosition(0);
                     JOptionPane.showMessageDialog(app.frame(), new JScrollPane(area),

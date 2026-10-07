@@ -149,7 +149,7 @@ public class TerminalPanel {
 
         @Override
         public Font getTerminalFont() {
-            return Ui.monoFont();
+            return Ui.consoleFont();
         }
 
         @Override

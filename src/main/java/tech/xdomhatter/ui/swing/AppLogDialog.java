@@ -17,7 +17,7 @@ public class AppLogDialog {
 
         JTextArea area = new JTextArea(28, 100);
         area.setEditable(false);
-        area.setFont(Ui.monoFont());
+        area.setFont(Ui.consoleFont());
         JScrollPane scroll = new JScrollPane(area);
         scroll.setBorder(null);
 

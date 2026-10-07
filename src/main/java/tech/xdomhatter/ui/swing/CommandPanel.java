@@ -112,7 +112,7 @@ public class CommandPanel {
 
         // ---- 输出区 ----
         output.setEditable(false);
-        output.setFont(Ui.monoFont());
+        output.setFont(Ui.consoleFont());
         output.setBackground(Ui.c("EditorPane.background", new Color(0x1B1C1E)));
         output.setForeground(Ui.c("EditorPane.foreground", new Color(0xD0D0D0)));
         historyBox.setRenderer(new DefaultListCellRenderer() {
