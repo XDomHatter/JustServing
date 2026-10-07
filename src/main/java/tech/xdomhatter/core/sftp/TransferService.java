@@ -19,6 +19,7 @@ import java.util.Locale;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -124,7 +125,7 @@ public class TransferService {
         Task t = new Task(seq.incrementAndGet(), Direction.UPLOAD, profileId, local.toString(), remoteDir);
         tasks.add(t);
         changed(t);
-        pool.submit(() -> run(t, () -> doUpload(t, local, remoteDir, resolver)));
+        submit(t, () -> doUpload(t, local, remoteDir, resolver));
         return t;
     }
 
@@ -132,8 +133,19 @@ public class TransferService {
         Task t = new Task(seq.incrementAndGet(), Direction.DOWNLOAD, profileId, remote, localDir.toString());
         tasks.add(t);
         changed(t);
-        pool.submit(() -> run(t, () -> doDownload(t, remote, localDir, resolver)));
+        submit(t, () -> doDownload(t, remote, localDir, resolver));
         return t;
+    }
+
+    /** 任务必须先入列表再提交；池不可用时立刻置 FAILED，避免任务永远停留在“排队中”。 */
+    private void submit(Task t, TaskBody body) {
+        try {
+            pool.submit(() -> run(t, body));
+        } catch (RejectedExecutionException e) {
+            t.state = State.FAILED;
+            t.error = "传输服务已停止";
+            changed(t);
+        }
     }
 
     public void cancel(Task t) {
@@ -272,8 +284,10 @@ public class TransferService {
         }
         if (policy == Conflict.RENAME) target = renameRemote(c, target);
         String part = target + ".part";
+        long base = t.transferred;
         try (InputStream in = Files.newInputStream(local)) {
-            c.put(in, part, monitor(t), ChannelSftp.OVERWRITE);
+            c.put(in, part, monitor(t, base), ChannelSftp.OVERWRITE);
+            t.transferred = base + Files.size(local);   // 末次 count 可能未触发，精确收尾
         } catch (Exception e) {
             try {
                 c.rm(part);
@@ -338,14 +352,18 @@ public class TransferService {
             target = Path.of(freeName(target.toString(), p -> Files.exists(Path.of(p))));
         }
         Path part = target.resolveSibling(target.getFileName() + ".part");
+        long base = t.transferred;
         try (OutputStream os = Files.newOutputStream(part)) {
-            InputStream is = c.get(remote, monitor(t));
+            InputStream is = c.get(remote, monitor(t, base));
             byte[] buf = new byte[64 * 1024];
             int n;
+            long got = 0;
             while ((n = is.read(buf)) > 0) {
+                got += n;
                 os.write(buf, 0, n);
             }
             is.close();
+            t.transferred = base + got;   // 末次 count 可能未触发，精确收尾
         } catch (Exception e) {
             try {
                 Files.deleteIfExists(part);
@@ -358,28 +376,37 @@ public class TransferService {
 
     // ---------- helpers ----------
 
-    private SftpProgressMonitor monitor(Task t) {
+    /**
+     * 进度回调按任务累计：baseBytes 为该文件开始前任务已完成字节数，
+     * count 的 soFar 只是当前文件的进度，二者相加才是整体进度。
+     */
+    SftpProgressMonitor monitor(Task t, long baseBytes) {
         return new SftpProgressMonitor() {
             long lastNs = System.nanoTime();
-            long lastBytes;
+            long lastCum = baseBytes;
 
             @Override
             public void init(int op, String src, String dest, long max) {
-                if (max > 0) t.totalBytes = max;
+                // 仅兜底：doUpload/doDownload 已设置任务总大小（文件夹为全树），
+                // 单文件的 max 不得覆盖，否则整体进度会在文件间来回跳
+                if (t.totalBytes <= 0 && max > 0) t.totalBytes = max;
             }
 
             @Override
             public boolean count(long soFar) {
-                t.transferred = soFar;
+                long cum = baseBytes + soFar;
+                t.transferred = cum;
                 t.lastProgress = System.currentTimeMillis();
                 long now = System.nanoTime();
                 if (now - lastNs > 500_000_000L) {
-                    double bps = (soFar - lastBytes) / ((now - lastNs) / 1e9);
+                    double bps = (cum - lastCum) / ((now - lastNs) / 1e9);
                     t.speedText = Fmt.speed(bps);
                     lastNs = now;
-                    lastBytes = soFar;
-                    bump(t);
+                    lastCum = cum;
                 }
+                // bump 内部按 t.lastNotify 做任务级节流；不能等 monitor 存活满 500ms，
+                // 否则小文件多的文件夹传输期间 UI 一次都不会刷新
+                bump(t);
                 return !t.cancel;
             }
 

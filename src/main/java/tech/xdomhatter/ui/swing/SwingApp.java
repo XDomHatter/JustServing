@@ -7,9 +7,14 @@ import tech.xdomhatter.core.store.CredentialVault;
 
 import javax.swing.*;
 import java.awt.*;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.util.concurrent.CountDownLatch;
 
 public class SwingApp {
     private final AppContext ctx;
+    /** 主线程等待该闩锁直到主窗口关闭，保证 run() 返回前应用一直运行。 */
+    private final CountDownLatch closed;
     private JFrame frame;
     private DefaultListModel<SshProfile> profileModel;
     private JList<SshProfile> profileList;
@@ -23,20 +28,34 @@ public class SwingApp {
     private AppPanel appPanel;
     private TerminalPanel terminalPanel;
     private SettingsPanel settingsPanel;
+    private Toast toast;
 
-    public SwingApp(AppContext ctx) {
+    public SwingApp(AppContext ctx, CountDownLatch closed) {
         this.ctx = ctx;
+        this.closed = closed;
     }
 
     public static void run(AppContext ctx) {
         Ui.install();
+        CountDownLatch closed = new CountDownLatch(1);
         SwingUtilities.invokeLater(() -> {
-            SwingApp app = new SwingApp(ctx);
-            if (!app.ensureVault()) {
-                System.exit(0);
+            try {
+                SwingApp app = new SwingApp(ctx, closed);
+                if (!app.ensureVault()) {
+                    System.exit(0);
+                }
+                app.show();
+            } catch (Throwable t) {
+                t.printStackTrace();
+                System.exit(1);
             }
-            app.show();
         });
+        // run() 必须阻塞到窗口关闭：否则 Main 立即返回并执行清理，传输线程池会在启动瞬间被关闭
+        try {
+            closed.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private boolean ensureVault() {
@@ -70,6 +89,13 @@ public class SwingApp {
     private void show() {
         frame = new JFrame("JustServing — 服务器管理");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // EXIT_ON_CLOSE 在 windowClosing 监听器之后才 System.exit，这里先放行等待中的主线程
+        frame.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                closed.countDown();
+            }
+        });
         frame.setIconImage(Ui.appIcon());
 
         profileModel = new DefaultListModel<>();
@@ -223,6 +249,15 @@ public class SwingApp {
 
     public void status(String s) {
         SwingUtilities.invokeLater(() -> statusLabel.setText(s));
+    }
+
+    /** 主窗口内轻量气泡提醒（如“上传成功”）。非模态、不抢焦点，连续调用只刷新当前气泡。 */
+    public void toast(String msg) {
+        SwingUtilities.invokeLater(() -> {
+            if (frame == null) return;
+            if (toast == null) toast = new Toast(frame);
+            toast.show(msg);
+        });
     }
 
     private void deleteSelected() {

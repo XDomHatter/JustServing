@@ -65,10 +65,15 @@ public class FilePanel {
             });
     private final AtomicInteger remoteReq = new AtomicInteger();
     private final AtomicInteger localReq = new AtomicInteger();
+    /** 已弹过提醒/已参与刷新判定的完成上传任务 id。 */
+    private final java.util.Set<Long> seenUploadDone = new java.util.HashSet<>();
+    /** 上传完成后刷新远程列表的防抖定时器。 */
+    private Timer remoteRefreshTimer;
 
     public FilePanel(SwingApp app) {
         this.app = app;
         build();
+        app.ctx().transfers.addListener(this::onTransfersChanged);
         remotePath.setText("未连接");
         refreshLocal();
     }
@@ -647,6 +652,37 @@ public class FilePanel {
             app.ctx().transfers.download(current.id, SftpOps.join(remoteDir, en.name()), localDir, r);
         }
         app.status("已加入下载队列 " + rows.length + " 项");
+    }
+
+    // ---------- 上传完成反馈 ----------
+
+    private void onTransfersChanged() {
+        SwingUtilities.invokeLater(this::scanFinishedUploads);
+    }
+
+    /**
+     * 扫描新完成的上传任务：弹“上传成功”气泡；目标目录是当前浏览目录时防抖刷新列表。
+     * 用任务 id 去重，只对本次事件中首次变为 DONE 的上传任务做出反应。
+     */
+    private void scanFinishedUploads() {
+        String profId = current != null ? current.id : null;
+        boolean fresh = false;
+        boolean matchesDir = false;
+        for (TransferService.Task t : app.ctx().transfers.tasks()) {
+            if (t.direction != TransferService.Direction.UPLOAD || t.state != TransferService.State.DONE) continue;
+            if (!seenUploadDone.add(t.id)) continue;
+            fresh = true;
+            if (profId != null && t.profileId.equals(profId) && t.dest.equals(remoteDir)) matchesDir = true;
+        }
+        if (!fresh) return;
+        app.toast("上传成功");
+        if (matchesDir) {
+            if (remoteRefreshTimer == null) {
+                remoteRefreshTimer = new Timer(800, e -> refreshRemote());
+                remoteRefreshTimer.setRepeats(false);
+            }
+            remoteRefreshTimer.restart();   // 多项连续完成只触发一次列表刷新
+        }
     }
 
     private void openSelectedRemoteFile() {

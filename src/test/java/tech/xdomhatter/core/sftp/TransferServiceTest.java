@@ -1,7 +1,9 @@
 package tech.xdomhatter.core.sftp;
 
+import com.jcraft.jsch.SftpProgressMonitor;
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -83,5 +85,51 @@ class TransferServiceTest {
         assertNull(t.sftp);
         assertTrue(TransferService.checkStale(t, 999_999, 60_000));
         assertEquals(TransferService.State.FAILED, t.state);
+    }
+
+    // ---------- 提交被拒（池已关闭）----------
+
+    @Test
+    void uploadMarksTaskFailedWhenPoolIsShutdown() {
+        var svc = new TransferService(null, 1);
+        svc.shutdown();
+        var t = svc.upload("p", Path.of("a.txt"), "/tmp", null);
+        assertEquals(TransferService.State.FAILED, t.state, "池关闭后任务不得停留在排队中");
+        assertFalse(t.error.isEmpty());
+    }
+
+    @Test
+    void downloadMarksTaskFailedWhenPoolIsShutdown() {
+        var svc = new TransferService(null, 1);
+        svc.shutdown();
+        var t = svc.download("p", "/tmp/a.txt", Path.of("."), null);
+        assertEquals(TransferService.State.FAILED, t.state, "池关闭后任务不得停留在排队中");
+        assertFalse(t.error.isEmpty());
+    }
+
+    // ---------- 进度回调：任务级累计 ----------
+
+    @Test
+    void monitorAccumulatesAcrossFilesAndKeepsTaskTotal() {
+        var svc = new TransferService(null, 1);
+        var t = new TransferService.Task(1, TransferService.Direction.UPLOAD, "p", "src", "dst");
+        t.totalBytes = 1000;      // 任务总大小（文件夹为全树）
+        t.transferred = 400;      // 前面的文件已完成 400 字节
+        SftpProgressMonitor m = svc.monitor(t, 400);
+        m.init(0, "s", "d", 600); // 当前文件 600 字节，不得覆盖任务总大小
+        assertEquals(1000, t.totalBytes);
+        m.count(300);
+        assertEquals(700, t.transferred);
+        m.count(600);
+        assertEquals(1000, t.transferred);
+    }
+
+    @Test
+    void monitorNotifiesUiOnFirstCount() {
+        var svc = new TransferService(null, 1);
+        var t = new TransferService.Task(1, TransferService.Direction.UPLOAD, "p", "src", "dst");
+        assertEquals(0, t.lastNotify);
+        svc.monitor(t, 0).count(1);
+        assertTrue(t.lastNotify > 0, "首次 count 就应触发 UI 刷新通知（节流不能随 monitor 重置）");
     }
 }
